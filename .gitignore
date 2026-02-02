@@ -1,0 +1,14 @@
+# env
+.env
+.env.*
+# venv
+venv/
+__pycache__/
+*.pyc
+
+# firebase secrets
+*firebase-adminsdk*.json
+serviceAccount*.json
+
+# misc
+.DS_Store

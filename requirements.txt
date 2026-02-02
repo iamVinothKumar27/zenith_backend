@@ -1,0 +1,13 @@
+Flask
+flask-cors
+python-dotenv
+google-generativeai
+google-api-python-client
+yt-dlp
+SpeechRecognition
+supadata
+requests
+pymongo
+firebase-admin
+PyPDF2
+gunicorn==22.0.0
