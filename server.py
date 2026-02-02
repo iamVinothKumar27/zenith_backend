@@ -160,7 +160,21 @@ QUIZ_BY_VIDEO = {}    # video_url -> {quiz_id, questions_only, full_quiz}
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB upload limit (PDF chat)
-CORS(app)
+
+ALLOWED_ORIGINS = [
+    "https://zenith.vinothkumarts.in",
+    "https://zenith-frontend-red.vercel.app",   # your vercel domain
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+    supports_credentials=True,
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
 
 # ----------------- AUTH: SYNC FIREBASE USER TO MONGODB -----------------
 @app.route("/auth/firebase", methods=["POST"])
