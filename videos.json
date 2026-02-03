@@ -2,144 +2,112 @@
   {
     "Week 1": [
       {
-        "topic": "What is React JS and its core concepts",
-        "video": "https://www.youtube.com/watch?v=s2skans2dP4"
+        "topic": "Object Oriented Programming Four Pillars Deep Dive",
+        "video": "https://www.youtube.com/watch?v=1ONhXmQuWP8"
       },
       {
-        "topic": "React JS environment setup for beginners",
-        "video": "https://www.youtube.com/watch?v=Ma6DRDIedVE"
+        "topic": "Object Oriented Programming Abstraction practical examples",
+        "video": "https://www.youtube.com/watch?v=pTB0EiLXUC8"
       },
       {
-        "topic": "React JS JSX syntax tutorial",
-        "video": "https://www.youtube.com/watch?v=s2skans2dP4"
+        "topic": "Object Oriented Programming Encapsulation real world use cases",
+        "video": "https://www.youtube.com/watch?v=pTB0EiLXUC8"
       },
       {
-        "topic": "React JS functional components deep dive",
-        "video": "https://www.youtube.com/watch?v=Cla1WwguArA"
+        "topic": "Object Oriented Programming Inheritance vs Composition explained",
+        "video": "https://www.youtube.com/watch?v=jfE7Ie93b9g"
       },
       {
-        "topic": "React JS props drilling explained",
-        "video": "https://www.youtube.com/watch?v=XyIXMQ9SZmI"
+        "topic": "Object Oriented Programming Polymorphism advanced concepts",
+        "video": "https://www.youtube.com/watch?v=pTB0EiLXUC8"
       },
       {
-        "topic": "React JS useState hook fundamental",
-        "video": "https://www.youtube.com/watch?v=V9i3cGD-mts"
-      },
-      {
-        "topic": "React JS event handling examples",
-        "video": "https://www.youtube.com/watch?v=Znqv84xi8Vs"
-      },
-      {
-        "topic": "React JS component lifecycle methods for functional components",
-        "video": "https://www.youtube.com/watch?v=kKVVan3EGoU"
+        "topic": "Object Oriented Programming Method Overloading vs Overriding",
+        "video": "https://www.youtube.com/watch?v=ryDeTfmSY_o"
       }
     ]
   },
   {
     "Week 2": [
       {
-        "topic": "React JS useEffect hook complete guide",
-        "video": "https://www.youtube.com/watch?v=-4XpG5_Lj_o"
+        "topic": "SOLID Principles Object Oriented Programming tutorial",
+        "video": "https://www.youtube.com/watch?v=kF7rQmSRlq0"
       },
       {
-        "topic": "React JS conditional rendering techniques",
-        "video": "https://www.youtube.com/watch?v=7o5FPaVA9m0"
+        "topic": "Single Responsibility Principle Object Oriented Programming",
+        "video": "https://www.youtube.com/watch?v=kF7rQmSRlq0"
       },
       {
-        "topic": "React JS list rendering with unique keys",
-        "video": "https://www.youtube.com/watch?v=fGxKOmCuH5w"
+        "topic": "Open Closed Principle Object Oriented Programming",
+        "video": "https://www.youtube.com/watch?v=kF7rQmSRlq0"
       },
       {
-        "topic": "React JS controlled components forms tutorial",
-        "video": "https://www.youtube.com/watch?v=CRSRK6dBOwU"
+        "topic": "Liskov Substitution Principle Object Oriented Programming",
+        "video": "https://www.youtube.com/watch?v=kF7rQmSRlq0"
       },
       {
-        "topic": "React JS useRef hook practical uses",
-        "video": "https://www.youtube.com/watch?v=42BkpGe8oxg"
+        "topic": "Interface Segregation Principle Object Oriented Programming",
+        "video": "https://www.youtube.com/watch?v=kF7rQmSRlq0"
       },
       {
-        "topic": "React JS useContext hook for global state",
-        "video": "https://www.youtube.com/watch?v=HYKDUF8X3qI"
-      },
-      {
-        "topic": "React JS custom hooks development",
-        "video": "https://www.youtube.com/watch?v=I2Bgi0Qcdvc"
-      },
-      {
-        "topic": "React JS basic project ideas with hooks",
-        "video": "https://www.youtube.com/watch?v=YxkcMszKEYY"
+        "topic": "Dependency Inversion Principle Object Oriented Programming",
+        "video": "https://www.youtube.com/watch?v=_CQuOfIqaGE"
       }
     ]
   },
   {
     "Week 3": [
       {
-        "topic": "React JS Router DOM v6 tutorial",
-        "video": "https://www.youtube.com/watch?v=Ul3y1LXxzdU"
+        "topic": "Object Oriented Programming Design Patterns explained",
+        "video": "https://www.youtube.com/watch?v=tv-_1er1mWI"
       },
       {
-        "topic": "React JS API data fetching with Axios",
-        "video": "https://www.youtube.com/watch?v=ZEKBDXGnD4s"
+        "topic": "Creational Design Patterns Object Oriented Programming",
+        "video": "https://www.youtube.com/watch?v=OuNOyFg942M"
       },
       {
-        "topic": "React JS Context API for state management",
-        "video": "https://www.youtube.com/watch?v=HYKDUF8X3qI"
+        "topic": "Structural Design Patterns Object Oriented Programming",
+        "video": "https://www.youtube.com/watch?v=tv-_1er1mWI"
       },
       {
-        "topic": "React JS styling options Styled Components",
-        "video": "https://www.youtube.com/watch?v=wIyHSOugGGw"
+        "topic": "Behavioral Design Patterns Object Oriented Programming",
+        "video": "https://www.youtube.com/watch?v=NU_1StN5Tkk"
       },
       {
-        "topic": "React JS Tailwind CSS integration",
-        "video": "https://www.youtube.com/watch?v=M_AIa5XD2YA"
+        "topic": "Factory Pattern Object Oriented Programming tutorial",
+        "video": "https://www.youtube.com/watch?v=tAuRQs_d9F8"
       },
       {
-        "topic": "React JS building a simple CRUD application",
-        "video": "https://www.youtube.com/watch?v=maGN8iGs744"
-      },
-      {
-        "topic": "React JS performance optimization with memo",
-        "video": "https://www.youtube.com/watch?v=CaShN6mCJB0"
-      },
-      {
-        "topic": "React JS useCallback and useMemo hooks",
-        "video": "https://www.youtube.com/watch?v=CSFMLmON5hM"
+        "topic": "Singleton Pattern Object Oriented Programming example",
+        "video": "https://www.youtube.com/watch?v=tSZn4wkBIu8"
       }
     ]
   },
   {
     "Week 4": [
       {
-        "topic": "React JS Redux Toolkit for state management",
-        "video": "https://www.youtube.com/watch?v=5yEG6GhoJBs"
+        "topic": "Object Oriented Programming Interview Questions",
+        "video": "https://www.youtube.com/watch?v=DPCsnuYIl7A"
       },
       {
-        "topic": "React JS authentication flow implementation",
-        "video": "https://www.youtube.com/watch?v=AcYF18oGn6Y"
+        "topic": "Object Oriented Analysis Design explained",
+        "video": "https://www.youtube.com/watch?v=pTB0EiLXUC8"
       },
       {
-        "topic": "React JS unit testing with Jest and RTL",
-        "video": "https://www.youtube.com/watch?v=JBSUgDxICg8"
+        "topic": "Object Oriented Programming best practices for placements",
+        "video": "https://www.youtube.com/watch?v=pTB0EiLXUC8"
       },
       {
-        "topic": "React JS deployment to Vercel Netlify",
-        "video": "https://www.youtube.com/watch?v=hAuyNf0Uk-w"
+        "topic": "Common Object Oriented Programming Code Review Scenarios",
+        "video": "https://www.youtube.com/watch?v=pTB0EiLXUC8"
       },
       {
-        "topic": "React JS interview questions and answers",
-        "video": "https://www.youtube.com/watch?v=b8pAPWsWIE4"
+        "topic": "Advanced Object Oriented Programming topics for system design",
+        "video": "https://www.youtube.com/watch?v=pTB0EiLXUC8"
       },
       {
-        "topic": "React JS resume project full stack ideas",
-        "video": "https://www.youtube.com/watch?v=CogZL5HBJgg"
-      },
-      {
-        "topic": "Build a complete React JS e-commerce project",
-        "video": "https://www.youtube.com/watch?v=jbfuzcrfjqQ"
-      },
-      {
-        "topic": "Advanced React JS patterns for placements",
-        "video": "https://www.youtube.com/watch?v=wIyHSOugGGw"
+        "topic": "Real world project using Object Oriented Programming principles",
+        "video": "https://www.youtube.com/watch?v=pTB0EiLXUC8"
       }
     ]
   }

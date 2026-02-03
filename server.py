@@ -1,5 +1,5 @@
 # server.py
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -18,8 +18,12 @@ import math
 import hashlib
 from datetime import datetime, timezone
 
+from werkzeug.utils import secure_filename
+
 from flask import g
 from pymongo import MongoClient
+import gridfs
+from bson.objectid import ObjectId
 import firebase_admin
 from firebase_admin import credentials as fb_credentials
 from firebase_admin import auth as fb_auth
@@ -161,6 +165,19 @@ QUIZ_BY_VIDEO = {}    # video_url -> {quiz_id, questions_only, full_quiz}
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB upload limit (PDF chat)
 
+# ----------------- PROFILE PHOTO UPLOADS -----------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROFILE_UPLOAD_DIR = os.path.join(BASE_DIR, "uploads", "profile")
+os.makedirs(PROFILE_UPLOAD_DIR, exist_ok=True)
+
+ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+@app.route("/uploads/profile/<path:filename>")
+def serve_profile_upload(filename):
+    # Public endpoint to serve profile photos
+    return send_from_directory(PROFILE_UPLOAD_DIR, filename)
+
 ALLOWED_ORIGINS = [
     "https://zenith.vinothkumarts.in",
     "https://zenith-frontend-red.vercel.app",   # your vercel domain
@@ -172,13 +189,10 @@ from flask_cors import CORS
 
 CORS(
   app,
-  resources={r"/*": {"origins": [
-    "https://zenith.vinothkumarts.in",
-    "https://zenith-frontend-red.vercel.app"
-  ]}},
+  resources={r"/*": {"origins": ALLOWED_ORIGINS}},
   supports_credentials=True,
   allow_headers=["Content-Type", "Authorization"],
-  methods=["GET","POST","OPTIONS"]
+  methods=["GET","POST","DELETE","OPTIONS"]
 )
 
 
@@ -222,6 +236,206 @@ def auth_firebase():
 
     user_doc = db.users.find_one({"uid": uid}, {"_id": 0})
     return jsonify({"ok": True, "user": user_doc})
+
+
+# ----------------- PROFILE (EXTRA FIELDS + LOCAL PHOTO) -----------------
+@app.route("/profile/me", methods=["GET"])
+def profile_me_get():
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+    db = get_db()
+    doc = db.users.find_one({"uid": user["uid"]}, {"_id": 0})
+    return jsonify({"ok": True, "user": doc or {}})
+
+
+@app.route("/profile/me", methods=["POST"])
+def profile_me_post():
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    data = request.get_json() or {}
+    # Only allow these fields to be written from the client
+    allowed = [
+        "name",
+        "dob",
+        "education",
+        "college",
+        "degree",
+        "department",
+        "yearBatch",
+        "year",
+        "phone",
+        "location",
+        "bio",
+        "photoURL",
+        "photoLocalURL",
+    ]
+    update = {k: (data.get(k) or "") for k in allowed if k in data}
+    # Normalize strings
+    for k, v in list(update.items()):
+        if isinstance(v, str):
+            update[k] = v.strip()
+
+    # Backward compatibility: accept `year` from client and also set `yearBatch`
+    if update.get("year") and not update.get("yearBatch"):
+        update["yearBatch"] = update["year"]
+
+    # Keep empty strings out (optional) except name
+    update["name"] = (update.get("name") or "").strip()
+    now = datetime.now(timezone.utc)
+    update["updatedAt"] = now
+
+    db = get_db()
+    db.users.update_one({"uid": user["uid"]}, {"$set": update}, upsert=True)
+    doc = db.users.find_one({"uid": user["uid"]}, {"_id": 0})
+    return jsonify({"ok": True, "user": doc})
+
+
+def _remove_existing_avatar_files(uid: str):
+    """Remove any existing avatar files for the user (uid.*)"""
+    try:
+        for fn in os.listdir(PROFILE_UPLOAD_DIR):
+            if fn.startswith(f"{uid}."):
+                try:
+                    os.remove(os.path.join(PROFILE_UPLOAD_DIR, fn))
+                except:
+                    pass
+    except:
+        pass
+
+
+def _profile_avatar_url(uid: str):
+    host = (request.host_url or "").rstrip("/")
+    return f"{host}/profile/photo/{uid}"
+
+
+@app.route("/profile/photo/<uid>", methods=["GET"])
+def profile_photo_get(uid):
+    """Serve the user's avatar from MongoDB GridFS if available, else from local uploads."""
+    db = get_db()
+    fs = gridfs.GridFS(db)
+
+    user_doc = db.users.find_one({"uid": uid}, {"_id": 0, "avatarFileId": 1}) or {}
+    fid = user_doc.get("avatarFileId")
+    if fid:
+        try:
+            gf = fs.get(ObjectId(fid))
+            data = gf.read()
+            ct = getattr(gf, "content_type", None) or getattr(gf, "contentType", None) or "application/octet-stream"
+            return (data, 200, {"Content-Type": ct, "Cache-Control": "no-store"})
+        except:
+            pass
+
+    # Fallback: try to serve local file uid.* if exists
+    try:
+        for fn in os.listdir(PROFILE_UPLOAD_DIR):
+            if fn.startswith(f"{uid}."):
+                return send_from_directory(PROFILE_UPLOAD_DIR, fn)
+    except:
+        pass
+
+    return jsonify({"error": "photo not found"}), 404
+
+
+@app.route("/profile/photo", methods=["POST"])
+def profile_photo_upload():
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    if "photo" not in request.files:
+        return jsonify({"error": "photo file missing"}), 400
+
+    f = request.files.get("photo")
+    if not f or not f.filename:
+        return jsonify({"error": "invalid photo"}), 400
+
+    db = get_db()
+    fs = gridfs.GridFS(db)
+    uid = user["uid"]
+
+    original = f.filename
+    _, ext = os.path.splitext(original)
+    ext = (ext or "").lower()
+    if not ext:
+        # Try to infer from mimetype
+        mt = (f.mimetype or "").lower()
+        if "jpeg" in mt or "jpg" in mt:
+            ext = ".jpg"
+        elif "png" in mt:
+            ext = ".png"
+        elif "webp" in mt:
+            ext = ".webp"
+
+    if ext not in ALLOWED_IMAGE_EXTS:
+        return jsonify({"error": "Only JPG / PNG / WEBP allowed"}), 400
+
+    # Replace existing avatar (GridFS) if present
+    current = db.users.find_one({"uid": uid}, {"_id": 0, "avatarFileId": 1}) or {}
+    old_fid = current.get("avatarFileId")
+    if old_fid:
+        try:
+            fs.delete(ObjectId(old_fid))
+        except:
+            pass
+
+    # Store in GridFS (more reliable on hosting than local disk)
+    content_type = (f.mimetype or "").strip() or "application/octet-stream"
+    file_id = fs.put(f.stream.read(), filename=f"avatar_{uid}{ext}", contentType=content_type)
+    public_url = _profile_avatar_url(uid)
+
+    # Also clean any old local file leftovers
+    _remove_existing_avatar_files(uid)
+
+    db.users.update_one(
+        {"uid": uid},
+        {"$set": {
+            "avatarFileId": str(file_id),
+            "photoLocalURL": public_url,
+            "photoURL": "",
+            "updatedAt": datetime.now(timezone.utc)
+        }},
+        upsert=True,
+    )
+    doc = db.users.find_one({"uid": user["uid"]}, {"_id": 0})
+    return jsonify({"ok": True, "user": doc})
+
+
+@app.route("/profile/photo", methods=["DELETE"])
+def profile_photo_delete():
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    uid = user["uid"]
+    db = get_db()
+    fs = gridfs.GridFS(db)
+
+    # Delete from GridFS if present
+    current = db.users.find_one({"uid": uid}, {"_id": 0, "avatarFileId": 1}) or {}
+    old_fid = current.get("avatarFileId")
+    if old_fid:
+        try:
+            fs.delete(ObjectId(old_fid))
+        except:
+            pass
+
+    # Also remove any local leftovers
+    _remove_existing_avatar_files(uid)
+
+    db.users.update_one(
+        {"uid": uid},
+        {"$set": {"photoLocalURL": "", "photoURL": "", "avatarFileId": "", "updatedAt": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    doc = db.users.find_one({"uid": uid}, {"_id": 0})
+    return jsonify({"ok": True, "user": doc})
 
 
 # ----------------- COURSE STATE CACHE (ROADMAP + VIDEOS) -----------------
