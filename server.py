@@ -168,13 +168,19 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
 ]
 
+from flask_cors import CORS
+
 CORS(
-    app,
-    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
-    supports_credentials=True,
-    allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  app,
+  resources={r"/*": {"origins": [
+    "https://zenith.vinothkumarts.in",
+    "https://zenith-frontend-red.vercel.app"
+  ]}},
+  supports_credentials=True,
+  allow_headers=["Content-Type", "Authorization"],
+  methods=["GET","POST","OPTIONS"]
 )
+
 
 # ----------------- AUTH: SYNC FIREBASE USER TO MONGODB -----------------
 @app.route("/auth/firebase", methods=["POST"])
