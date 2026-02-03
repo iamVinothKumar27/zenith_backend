@@ -1024,8 +1024,7 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
 # ✅ Supadata
-supadata = Supadata(api_key="sd_65758c6c04d4088966ec9645e7724119")
-
+supadata = Supadata(api_key=os.getenv("SUPADATA_KEY", ""))
 # ----------------- HELPERS -----------------
 def is_quota_error(e: Exception) -> bool:
     msg = str(e).lower()
