@@ -183,6 +183,7 @@ ALLOWED_ORIGINS = [
     "https://zenith-frontend-red.vercel.app",   # your vercel domain
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://www.zenithlearning.site"
 ]
 
 from flask_cors import CORS
