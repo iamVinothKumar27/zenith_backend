@@ -1590,7 +1590,7 @@ def admin_delete_user():
     if admin_user.get("uid") == target_uid:
         return jsonify({"error": "You cannot delete your own account."}), 400
 
-        db = get_db()
+    db = get_db()
 
     # ✅ fetch user's email + name before deletion
     target_doc = db.users.find_one(
