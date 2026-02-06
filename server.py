@@ -158,7 +158,7 @@ SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
-MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER).strip()  # e.g. no-reply@zenithlearning.site
+MAIL_FROM = (os.getenv("MAIL_FROM") or os.getenv("SMTP_FROM") or SMTP_USER).strip()  # e.g. no-reply@zenithlearning.site
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
 SENDGRID_FROM = os.getenv("SENDGRID_FROM", "").strip()  # optional; defaults to MAIL_FROM\n\nFRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", os.getenv("FRONTEND_URL", "")).strip().rstrip("/")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@zenithlearning.site").strip()
@@ -274,23 +274,99 @@ def _send_email_sync_sendgrid(to_email: str, subject: str, html_body: str, text_
         return False
 
 
+def _send_email_sync_mailgun(to_email: str, subject: str, html_body: str, text_body: str = "") -> bool:
+    """Send email via Mailgun HTTP API. Returns True if Mailgun accepted the message."""
+    api_key = os.getenv("MAILGUN_API_KEY", "").strip()
+    domain = os.getenv("MAILGUN_DOMAIN", "").strip()
+    if not api_key or not domain:
+        return False
+
+    # API base: US (default) or EU (set MAILGUN_BASE_URL=https://api.eu.mailgun.net)
+    base_url = (os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net").strip().rstrip("/"))
+    endpoint = f"{base_url}/v3/{domain}/messages"
+
+    from_email = (os.getenv("MAILGUN_FROM", "").strip() or os.getenv("MAIL_FROM", "").strip() or os.getenv("SMTP_FROM", "").strip() or SMTP_USER).strip()
+    if not from_email:
+        return False
+
+    data = {
+        "from": f"Zenith Learning <{from_email}>",
+        "to": [to_email],
+        "subject": subject,
+        "text": text_body or " ",
+        "html": html_body,
+    }
+
+    try:
+        import requests  # type: ignore
+    except Exception:
+        requests = None
+
+    try:
+        if requests:
+            r = requests.post(
+                endpoint,
+                auth=("api", api_key),
+                data=data,
+                timeout=10,
+            )
+            if 200 <= r.status_code < 300:
+                print("[MAIL] Mailgun accepted:", subject, "->", to_email)
+                return True
+            print("[MAIL] Mailgun failed:", r.status_code, getattr(r, "text", ""))
+            return False
+        else:
+            # Minimal fallback without requests
+            import urllib.request
+            import urllib.parse
+            import base64
+
+            encoded = urllib.parse.urlencode({k: (v[0] if isinstance(v, list) else v) for k, v in data.items()}).encode("utf-8")
+            auth_header = base64.b64encode(f"api:{api_key}".encode("utf-8")).decode("ascii")
+            req = urllib.request.Request(
+                endpoint,
+                data=encoded,
+                headers={"Authorization": f"Basic {auth_header}", "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                code = getattr(resp, "status", 200)
+                if 200 <= code < 300:
+                    print("[MAIL] Mailgun accepted:", subject, "->", to_email)
+                    return True
+                print("[MAIL] Mailgun failed:", code)
+                return False
+    except Exception as e:
+        print("[MAIL] Mailgun send failed:", e)
+        return False
+
+
+
 def _send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
     """Queue email sending to avoid blocking web requests.
 
     Hosted platforms (like Render/Heroku) often have strict request timeouts.
     We send on a background thread so endpoints return quickly.
     Priority:
-      1) SendGrid API if SENDGRID_API_KEY is set
-      2) SMTP otherwise
+      1) Mailgun API if MAILGUN_API_KEY and MAILGUN_DOMAIN are set
+      2) SendGrid API if SENDGRID_API_KEY is set
+      3) SMTP otherwise
     """
     if not to_email:
         return
 
     def _job():
-        # Prefer SendGrid if configured (more reliable on hosted platforms).
+        # Prefer Mailgun if configured (most reliable on hosted platforms).
+        if os.getenv("MAILGUN_API_KEY", "").strip() and os.getenv("MAILGUN_DOMAIN", "").strip():
+            if _send_email_sync_mailgun(to_email, subject, html_body, text_body):
+                return
+
+        # Next prefer SendGrid if configured.
         if os.getenv("SENDGRID_API_KEY", "").strip():
             if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
                 return
+
+        # Fallback: SMTP (may be blocked on some hosts).
         _send_email_sync_smtp(to_email, subject, html_body, text_body)
 
     try:
