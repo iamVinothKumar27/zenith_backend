@@ -159,20 +159,20 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
 MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER).strip()  # e.g. no-reply@zenithlearning.site
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", os.getenv("FRONTEND_URL", "")).strip().rstrip("/")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
+SENDGRID_FROM = os.getenv("SENDGRID_FROM", "").strip()  # optional; defaults to MAIL_FROM\n\nFRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", os.getenv("FRONTEND_URL", "")).strip().rstrip("/")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@zenithlearning.site").strip()
 
 def _smtp_ready() -> bool:
     return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and MAIL_FROM)
 
-def _send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
-    """Send an email via SMTP. Safe no-op if SMTP isn't configured."""
+def _send_email_sync_smtp(to_email: str, subject: str, html_body: str, text_body: str = "") -> bool:
+    """Send email via SMTP. Returns True if sent, False otherwise."""
     if not to_email:
-        return
+        return False
     if not _smtp_ready():
-        # Don't crash app if SMTP isn't configured yet
         print("[MAIL] SMTP not configured. Skipping send to:", to_email, "subject:", subject)
-        return
+        return False
 
     msg = MIMEMultipart("alternative")
     msg["From"] = f"Zenith Learning <{MAIL_FROM}>"
@@ -183,20 +183,127 @@ def _send_email(to_email: str, subject: str, html_body: str, text_body: str = ""
         msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
+    # Keep timeouts low to avoid Gunicorn worker timeouts on hosted deployments.
+    connect_timeout = int(os.getenv("SMTP_TIMEOUT", "8"))
+
     try:
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
-        server.ehlo()
-        try:
-            server.starttls()
+        if int(SMTP_PORT) == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=connect_timeout)
             server.ehlo()
-        except Exception:
-            pass
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=connect_timeout)
+            server.ehlo()
+            try:
+                server.starttls()
+                server.ehlo()
+            except Exception:
+                # Some providers don't require STARTTLS on certain ports.
+                pass
+
         server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(MAIL_FROM, [to_email], msg.as_string())
         server.quit()
-        print("[MAIL] Sent:", subject, "->", to_email)
+        print("[MAIL] SMTP Sent:", subject, "->", to_email)
+        return True
     except Exception as e:
-        print("[MAIL] Send failed:", e)
+        print("[MAIL] SMTP Send failed:", e)
+        try:
+            server.quit()
+        except Exception:
+            pass
+        return False
+
+
+def _send_email_sync_sendgrid(to_email: str, subject: str, html_body: str, text_body: str = "") -> bool:
+    """Send email via SendGrid Web API. Returns True if accepted by SendGrid."""
+    api_key = os.getenv("SENDGRID_API_KEY", "").strip()
+    if not api_key:
+        return False
+
+    from_email = os.getenv("SENDGRID_FROM", "").strip() or MAIL_FROM
+    if not from_email:
+        return False
+
+    try:
+        import requests  # type: ignore
+    except Exception:
+        requests = None
+
+    payload = {
+        "personalizations": [{
+            "to": [{"email": to_email}],
+            "subject": subject,
+        }],
+        "from": {"email": from_email, "name": "Zenith Learning"},
+        "content": [
+            {"type": "text/plain", "value": text_body or " "},
+            {"type": "text/html", "value": html_body},
+        ],
+    }
+
+    try:
+        if requests:
+            r = requests.post(
+                "https://api.sendgrid.com/v3/mail/send",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=10,
+            )
+            if 200 <= r.status_code < 300:
+                print("[MAIL] SendGrid accepted:", subject, "->", to_email)
+                return True
+            print("[MAIL] SendGrid failed:", r.status_code, getattr(r, "text", ""))
+            return False
+        else:
+            # Minimal fallback without requests
+            import urllib.request
+            import urllib.error
+
+            req = urllib.request.Request(
+                "https://api.sendgrid.com/v3/mail/send",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                ok = 200 <= resp.status < 300
+                print("[MAIL] SendGrid accepted:", ok, subject, "->", to_email)
+                return ok
+    except Exception as e:
+        print("[MAIL] SendGrid send failed:", e)
+        return False
+
+
+def _send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
+    """Queue email sending to avoid blocking web requests.
+
+    Hosted platforms (like Render/Heroku) often have strict request timeouts.
+    We send on a background thread so endpoints return quickly.
+    Priority:
+      1) SendGrid API if SENDGRID_API_KEY is set
+      2) SMTP otherwise
+    """
+    if not to_email:
+        return
+
+    def _job():
+        # Prefer SendGrid if configured (more reliable on hosted platforms).
+        if os.getenv("SENDGRID_API_KEY", "").strip():
+            if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
+                return
+        _send_email_sync_smtp(to_email, subject, html_body, text_body)
+
+    try:
+        import threading
+        t = threading.Thread(target=_job, daemon=True)
+        t.start()
+    except Exception as e:
+        print("[MAIL] Could not spawn mail thread:", e)
+        # Fall back to sync (still with small timeouts).
+        if os.getenv("SENDGRID_API_KEY", "").strip():
+            if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
+                return
+        _send_email_sync_smtp(to_email, subject, html_body, text_body)
 
 def _brand_email(title: str, preheader: str, body_html: str, primary_cta: dict = None, secondary_cta: dict = None):
     """Return a professional, branded email HTML."""
@@ -287,7 +394,7 @@ def _safe_public_url(path: str) -> str:
     3) Fallback to request Origin (if available)
     4) Last resort: return path (will not work in email clients)
     """
-    base = (FRONTEND_BASE_URL or os.getenv("FRONTEND_URL", "") or "").strip().rstrip("/")
+    base = (os.getenv("FRONTEND_BASE_URL") or os.getenv("FRONTEND_URL") or "").strip().rstrip("/")
 
     # best-effort fallback (sometimes request has Origin)
     if not base:
