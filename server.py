@@ -16,7 +16,17 @@ import uuid
 import math
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+# ---- datetime helpers (avoid naive vs aware issues) ----
+def _to_utc_aware(dt):
+    """Ensure a datetime is timezone-aware in UTC (Mongo may return naive UTC)."""
+    if not dt or not isinstance(dt, datetime):
+        return dt
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
 
 from werkzeug.utils import secure_filename
 
@@ -28,6 +38,279 @@ import firebase_admin
 from firebase_admin import credentials as fb_credentials
 from firebase_admin import auth as fb_auth
 load_dotenv()  
+
+# ----------------- EMAIL (SMTP: Titan/GoDaddy etc.) -----------------
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import re
+
+def _yt_id(url: str) -> str:
+    """Extract YouTube ID from watch?v= or youtu.be links."""
+    if not url:
+        return ""
+    m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{6,})", url)
+    return m.group(1) if m else ""
+
+
+def derive_video_number_from_course(db, uid: str, course_title: str, video_url: str):
+    """
+    Returns (video_no, total_videos) like (4, 32) by searching course_states.videos
+    Supports shapes:
+      1) [{"Week 1": [{"topic":..., "video": URL}, ...]}, {"Week 2": [...]}]   ✅ your current build_weekly_json
+      2) [{"week":"Week 1","videos":[{"videoUrl":...}, ...]}]
+      3) flat list of urls or dicts
+    """
+    if not uid or not course_title or not video_url:
+        return (None, None)
+
+    target_id = _yt_id(video_url) or video_url.strip()
+
+    state = db.course_states.find_one(
+        {"uid": uid, "courseTitle": course_title},
+        {"videos": 1, "weeks": 1, "course": 1}
+    )
+    if not state:
+        return (None, None)
+
+    def _get_url(obj):
+        if obj is None:
+            return ""
+        if isinstance(obj, str):
+            return obj.strip()
+        if isinstance(obj, dict):
+            return (obj.get("videoUrl")
+                    or obj.get("video_url")
+                    or obj.get("url")
+                    or obj.get("video")
+                    or "").strip()
+        return str(obj).strip()
+
+    def _flatten_video_urls(node):
+        out = []
+
+        if node is None:
+            return out
+
+        # string url
+        if isinstance(node, str):
+            u = node.strip()
+            if u:
+                out.append(u)
+            return out
+
+        # list -> recurse each
+        if isinstance(node, list):
+            for it in node:
+                out.extend(_flatten_video_urls(it))
+            return out
+
+        # dict -> handle multiple schema
+        if isinstance(node, dict):
+            # A) {"videos": [ ... ]}
+            if isinstance(node.get("videos"), list):
+                for v in node.get("videos"):
+                    u = _get_url(v)
+                    if u:
+                        out.append(u)
+                    else:
+                        out.extend(_flatten_video_urls(v))
+                return out
+
+            # B) build_weekly_json: {"Week 1": [ {topic, video}, ... ]}
+            for k, v in node.items():
+                if isinstance(v, list):
+                    # likely week list
+                    for item in v:
+                        u = _get_url(item)  # ✅ reads "video" key
+                        if u:
+                            out.append(u)
+                        else:
+                            out.extend(_flatten_video_urls(item))
+                else:
+                    out.extend(_flatten_video_urls(v))
+            return out
+
+        return out
+
+    # ✅ pull weeks/videos from all possible places
+    videos_root = state.get("videos")
+    if not videos_root and isinstance(state.get("course"), dict):
+        videos_root = state["course"].get("videos") or state["course"].get("weeks")
+    if not videos_root:
+        videos_root = state.get("weeks")
+
+    flattened = _flatten_video_urls(videos_root)
+    if not flattened:
+        return (None, None)
+
+    total = len(flattened)
+
+    # match by youtube id (preferred) else full url
+    for idx, vurl in enumerate(flattened, start=1):
+        vid = _yt_id(vurl) or vurl.strip()
+        if vid and target_id and vid == target_id:
+            return (idx, total)
+
+    return (None, total)
+
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
+MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER).strip()  # e.g. no-reply@zenithlearning.site
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", os.getenv("FRONTEND_URL", "")).strip().rstrip("/")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@zenithlearning.site").strip()
+
+def _smtp_ready() -> bool:
+    return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and MAIL_FROM)
+
+def _send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
+    """Send an email via SMTP. Safe no-op if SMTP isn't configured."""
+    if not to_email:
+        return
+    if not _smtp_ready():
+        # Don't crash app if SMTP isn't configured yet
+        print("[MAIL] SMTP not configured. Skipping send to:", to_email, "subject:", subject)
+        return
+
+    msg = MIMEMultipart("alternative")
+    msg["From"] = f"Zenith Learning <{MAIL_FROM}>"
+    msg["To"] = to_email
+    msg["Subject"] = subject
+
+    if text_body:
+        msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    try:
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
+        server.ehlo()
+        try:
+            server.starttls()
+            server.ehlo()
+        except Exception:
+            pass
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(MAIL_FROM, [to_email], msg.as_string())
+        server.quit()
+        print("[MAIL] Sent:", subject, "->", to_email)
+    except Exception as e:
+        print("[MAIL] Send failed:", e)
+
+def _brand_email(title: str, preheader: str, body_html: str, primary_cta: dict = None, secondary_cta: dict = None):
+    """Return a professional, branded email HTML."""
+    logo_text = "Zenith Learning"
+    year = datetime.now().year
+    primary_btn = ""
+    if primary_cta and primary_cta.get("url") and primary_cta.get("label"):
+        primary_btn = f"""
+        <a href="{primary_cta.get('url')}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:700;font-size:14px;">
+          {primary_cta.get('label')}
+        </a>"""
+    secondary_btn = ""
+    if secondary_cta and secondary_cta.get("url") and secondary_cta.get("label"):
+        secondary_btn = f"""
+        <a href="{secondary_cta.get('url')}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:700;font-size:14px;">
+          {secondary_cta.get('label')}
+        </a>"""
+
+    cta_row = ""
+    if primary_btn or secondary_btn:
+        cta_row = f"<tr><td style='padding:12px 24px 22px 24px;'>{primary_btn} &nbsp; {secondary_btn}</td></tr>"
+
+    primary_url = (primary_cta.get('url') if primary_cta else "") or ""
+
+    html = f"""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+  </head>
+  <body style="margin:0;padding:0;background:#f6f7fb;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#111827;">
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">{preheader}</div>
+
+    <table width="100%" cellspacing="0" cellpadding="0" style="background:#f6f7fb;padding:28px 10px;">
+      <tr>
+        <td align="center">
+          <table width="640" cellspacing="0" cellpadding="0" style="background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 10px 30px rgba(17,24,39,0.08);">
+            <tr>
+              <td style="background:linear-gradient(135deg,#0ea5e9,#2563eb);padding:22px 24px;">
+                <div style="font-size:16px;font-weight:800;color:#ffffff;letter-spacing:0.2px;">{logo_text}</div>
+                <div style="font-size:12px;color:rgba(255,255,255,0.9);margin-top:4px;">Smart learning • Roadmaps • Quizzes • Progress</div>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:26px 24px 6px 24px;">
+                <div style="font-size:20px;font-weight:800;line-height:1.25;">{title}</div>
+                <div style="font-size:13px;color:#6b7280;margin-top:8px;">{preheader}</div>
+              </td>
+            </tr>
+
+            <tr>
+              <td style="padding:10px 24px 6px 24px;font-size:14px;line-height:1.65;color:#111827;">
+                {body_html}
+              </td>
+            </tr>
+
+            {cta_row}
+
+            <tr>
+              <td style="padding:0 24px 22px 24px;">
+                <div style="border-top:1px solid #e5e7eb;padding-top:14px;font-size:12px;color:#6b7280;line-height:1.6;">
+                  Need help? Reply to this email or contact our team from the <b>Contact</b> page in the app.<br/>
+                  <span style="color:#9ca3af;">© {year} Zenith Learning. All rights reserved.</span>
+                </div>
+              </td>
+            </tr>
+          </table>
+
+          <div style="width:640px;font-size:12px;color:#9ca3af;line-height:1.5;margin-top:10px;text-align:center;">
+            If the button doesn't work, copy and paste this link in your browser:<br/>
+            <span style="word-break:break-all;">{primary_url}</span>
+          </div>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>"""
+    return html
+
+def _safe_public_url(path: str) -> str:
+    """
+    Always return an ABSOLUTE URL for emails.
+    Priority:
+    1) FRONTEND_BASE_URL env (recommended)
+    2) FRONTEND_URL env
+    3) Fallback to request Origin (if available)
+    4) Last resort: return path (will not work in email clients)
+    """
+    base = (FRONTEND_BASE_URL or os.getenv("FRONTEND_URL", "") or "").strip().rstrip("/")
+
+    # best-effort fallback (sometimes request has Origin)
+    if not base:
+        try:
+            origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+            if origin:
+                base = origin
+        except Exception:
+            pass
+
+    if not path.startswith("/"):
+        path = "/" + path
+
+    return (base + path) if base else path
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def _now_ist_str():
+    # Example: 2026-02-06 01:10 AM IST
+    return datetime.now(IST).strftime("%Y-%m-%d %I:%M %p IST")
+
+
+
 # ----------------- MONGODB + FIREBASE AUTH -----------------
 MONGODB_URI = os.getenv("MONGODB_URI", "")
 MONGODB_DB = os.getenv("MONGODB_DB", "zenith")
@@ -218,7 +501,25 @@ def auth_firebase():
     db = get_db()
     now = datetime.now(timezone.utc)
 
-    db.users.update_one(
+    # ✅ Ensure Mongo user doc exists (manual signup may verify before first login)
+    try:
+        db.users.update_one(
+            {"uid": uid},
+            {"$set": {
+                "uid": uid,
+                "email": email,
+                "name": (user.get("name") or ""),
+                "photoURL": (user.get("picture") or user.get("photoURL") or ""),
+                "providerId": "password",
+                "updatedAt": now,
+            }, "$setOnInsert": {"createdAt": now, "role": "user"}},
+            upsert=True
+        )
+    except Exception as e:
+        print(f"[WARN] Mongo upsert during send-verification failed: {e}")
+
+
+    res = db.users.update_one(
         {"uid": uid},
         {"$set": {
             "uid": uid,
@@ -235,8 +536,371 @@ def auth_firebase():
         upsert=True
     )
 
+    # ✅ Send welcome email for SSO (Google) only for first-time sign-in
+    try:
+        is_new = bool(getattr(res, "upserted_id", None))
+        if is_new and (providerId or "").lower().startswith("google"):
+            # Avoid duplicates if user doc already has the flag
+            udoc = db.users.find_one({"uid": uid}, projection={"_id": 0, "welcomeSsoSent": 1, "name": 1}) or {}
+            if not udoc.get("welcomeSsoSent"):
+                home_url = _safe_public_url("/")
+                body = f"""
+                <p style="margin:0 0 10px 0;">Hi <b>{(name or 'there')}</b>,</p>
+                <p style="margin:0 0 10px 0;">
+                  Welcome to <b>Zenith Learning</b>! Your Google sign-in is set up and you're ready to start learning.
+                </p>
+                <p style="margin:0 0 10px 0;">Here are a few quick tips to get the best experience:</p>
+                <ul style="margin:10px 0 10px 20px;">
+                  <li>Create a roadmap to structure your learning in weeks</li>
+                  <li>Complete quizzes after each video to unlock the next content</li>
+                  <li>Track progress in <b>My Courses</b> and continue anytime</li>
+                </ul>
+                """
+                html = _brand_email(
+                    "Welcome to Zenith Learning 🎉",
+                    "Your Google sign-in is ready — begin your roadmap today.",
+                    body,
+                    primary_cta={"label": "Start learning", "url": home_url},
+                    secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")}
+                )
+                _send_email(email, "Welcome to Zenith Learning", html)
+                db.users.update_one({"uid": uid}, {"$set": {"welcomeSsoSent": True, "updatedAt": now}})
+    except Exception as _e:
+        pass
+
+
     user_doc = db.users.find_one({"uid": uid}, {"_id": 0})
-    return jsonify({"ok": True, "user": user_doc})
+    return jsonify({
+        "ok": True,
+        "user": user_doc
+    })
+
+    
+# ----------------- AUTH EMAIL FLOWS (Verification + Password reset) -----------------
+
+def _new_token() -> str:
+    return uuid.uuid4().hex + uuid.uuid4().hex  # 64 chars
+
+@app.route("/auth/send-verification", methods=["POST"])
+def auth_send_verification():
+    """
+    Send a custom verification email (SMTP) for password-based signups.
+    Requires Firebase ID token. We DO NOT create accounts here; we simply verify/activate.
+    """
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    email = user.get("email") or ""
+    uid = user.get("uid") or ""
+    if not email or not uid:
+        return jsonify({"error": "email/uid missing"}), 400
+
+    db = get_db()
+    now = datetime.now(timezone.utc)
+
+    # ✅ Ensure Mongo user doc exists (manual signup may verify before first login)
+    try:
+        db.users.update_one(
+            {"uid": uid},
+            {"$set": {
+                "uid": uid,
+                "email": email,
+                "name": (user.get("name") or ""),
+                "photoURL": (user.get("picture") or user.get("photoURL") or ""),
+                "providerId": "password",
+                "updatedAt": now,
+            }, "$setOnInsert": {"createdAt": now, "role": "user"}},
+            upsert=True
+        )
+    except Exception as e:
+        print(f"[WARN] Mongo upsert during send-verification failed: {e}")
+
+
+    # If already verified, avoid re-sending
+    try:
+        _init_firebase_admin()
+        u = fb_auth.get_user(uid)
+        if getattr(u, "email_verified", False):
+            return jsonify({"ok": True, "alreadyVerified": True})
+    except Exception:
+        pass
+
+    token = _new_token()
+    # Store token
+    db.email_verifications.insert_one({
+        "token": token,
+        "uid": uid,
+        "email": email,
+        "used": False,
+        "createdAt": now,
+        "expiresAt": now + timedelta(hours=24),
+    })
+
+    verify_url = _safe_public_url(f"/verify-email?token={token}")
+    body = f"""
+    <p style="margin:0 0 10px 0;">Hi <b>{(user.get('name') or 'there')}</b>,</p>
+    <p style="margin:0 0 10px 0;">
+      Thanks for signing up for <b>Zenith Learning</b>. To activate your account and start saving courses and progress,
+      please verify your email address.
+    </p>
+    <ul style="margin:10px 0 10px 20px;">
+      <li>This verification link is valid for <b>24 hours</b>.</li>
+      <li>If you didn’t create this account, you can safely ignore this email.</li>
+    </ul>
+    <p style="margin:10px 0 0 0;">Click the button below to continue.</p>
+    """
+    html = _brand_email(
+        "Verify your email to activate your Zenith account",
+        "One quick step to activate your account and start learning.",
+        body,
+        primary_cta={"label": "Open verification page", "url": verify_url},
+    )
+    _send_email(email, "Verify your Zenith Learning email", html)
+    return jsonify({"ok": True})
+
+@app.route("/auth/verify-email", methods=["POST"])
+def auth_verify_email():
+    """
+    Verify token, then mark Firebase user as emailVerified.
+    Also sends a welcome email (manual signup) exactly once.
+    """
+    data = request.get_json() or {}
+    token = (data.get("token") or "").strip()
+    if not token:
+        return jsonify({"error": "token required"}), 400
+
+    db = get_db()
+    now = datetime.now(timezone.utc)
+
+
+    rec = db.email_verifications.find_one({"token": token})
+    if not rec:
+        return jsonify({"error": "Invalid or expired token"}), 400
+    if rec.get("used"):
+        return jsonify({"ok": True, "alreadyUsed": True})
+    exp = _to_utc_aware(rec.get("expiresAt"))
+    if exp and isinstance(exp, datetime) and exp < now:
+        return jsonify({"error": "Token expired"}), 400
+
+    uid = rec.get("uid")
+    email = rec.get("email")
+
+    # ✅ Ensure user exists in MongoDB even if the user verified before first login
+    db.users.update_one(
+        {"uid": uid},
+        {"$set": {"uid": uid, "email": email, "updatedAt": now},
+         "$setOnInsert": {"createdAt": now, "role": "user", "providerId": "password"}},
+        upsert=True
+    )
+
+    try:
+        _init_firebase_admin()
+        fb_auth.update_user(uid, email_verified=True)
+    except Exception as e:
+        return jsonify({"error": f"Firebase update failed: {e}"}), 500
+
+    db.email_verifications.update_one({"token": token}, {"$set": {"used": True, "usedAt": now}})
+
+    # Welcome email for manual signup (send only once)
+    user_doc = db.users.find_one({"uid": uid}, projection={"_id": 0}) or {}
+    if not user_doc.get("welcomeManualSent"):
+        home_url = _safe_public_url("/")
+        body = f"""
+        <p style="margin:0 0 10px 0;">Hi <b>{(user_doc.get('name') or 'there')}</b>,</p>
+        <p style="margin:0 0 10px 0;">
+          Your email is verified ✅. Welcome to <b>Zenith Learning</b>!
+        </p>
+        <p style="margin:0 0 10px 0;">
+          Here’s what you can do next:
+        </p>
+        <ul style="margin:10px 0 10px 20px;">
+          <li>Create a personalized learning roadmap</li>
+          <li>Track video progress and quiz performance</li>
+          <li>Resume anytime from <b>My Courses</b></li>
+          <li>Use Notes to save important points</li>
+        </ul>
+        <p style="margin:10px 0 0 0;">Ready to continue?</p>
+        """
+        html = _brand_email(
+            "Welcome to Zenith Learning 🎉",
+            "Your account is active. Let’s start learning.",
+            body,
+            primary_cta={"label": "Go to Zenith", "url": home_url},
+            secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")}
+        )
+        _send_email(email, "Welcome to Zenith Learning", html)
+        db.users.update_one({"uid": uid}, {"$set": {"welcomeManualSent": True, "updatedAt": now}}, upsert=True)
+
+    return jsonify({"ok": True})
+
+@app.route("/auth/password-reset/request", methods=["POST"])
+def auth_password_reset_request():
+    """
+    Send a password reset email using SMTP.
+    Always returns ok to avoid account enumeration.
+    """
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "email required"}), 400
+
+    db = get_db()
+    now = datetime.now(timezone.utc)
+
+
+    token = _new_token()
+
+    try:
+        _init_firebase_admin()
+        u = fb_auth.get_user_by_email(email)
+        uid = u.uid
+    except Exception:
+        # Return ok even if not found
+        return jsonify({"ok": True})
+
+    db.password_resets.insert_one({
+        "token": token,
+        "uid": uid,
+        "email": email,
+        "used": False,
+        "createdAt": now,
+        "expiresAt": now + timedelta(hours=1),
+    })
+
+    reset_url = _safe_public_url(f"/reset-password?token={token}")
+    body = f"""
+    <p style="margin:0 0 10px 0;">Hi,</p>
+    <p style="margin:0 0 10px 0;">
+      We received a request to reset the password for your Zenith Learning account (<b>{email}</b>).
+    </p>
+    <p style="margin:0 0 10px 0;">
+      If you initiated this request, click the button below to set a new password.
+      This link is valid for <b>1 hour</b>.
+    </p>
+    <ul style="margin:10px 0 10px 20px;">
+      <li>If you did not request a reset, you can ignore this email.</li>
+      <li>For security, never share your password with anyone.</li>
+    </ul>
+    """
+    html = _brand_email(
+        "Reset your Zenith Learning password",
+        "Use the button below to set a new password (valid for 1 hour).",
+        body,
+        primary_cta={"label": "Reset password", "url": reset_url},
+    )
+    _send_email(email, "Reset your Zenith Learning password", html)
+    return jsonify({"ok": True})
+
+@app.route("/auth/password-reset/confirm", methods=["POST"])
+def auth_password_reset_confirm():
+    data = request.get_json() or {}
+    token = (data.get("token") or "").strip()
+    new_password = (data.get("newPassword") or "").strip()
+    if not token or not new_password:
+        return jsonify({"error": "token and newPassword required"}), 400
+    if len(new_password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+
+    db = get_db()
+    now = datetime.now(timezone.utc)
+
+
+    rec = db.password_resets.find_one({"token": token})
+    if not rec:
+        return jsonify({"error": "Invalid or expired token"}), 400
+    if rec.get("used"):
+        return jsonify({"error": "Token already used"}), 400
+    exp = _to_utc_aware(rec.get("expiresAt"))
+    if exp and isinstance(exp, datetime) and exp < now:
+        return jsonify({"error": "Token expired"}), 400
+
+    uid = rec.get("uid")
+    email = rec.get("email")
+
+    # ✅ Ensure user exists in MongoDB even if the user verified before first login
+    db.users.update_one(
+        {"uid": uid},
+        {"$set": {"uid": uid, "email": email, "updatedAt": now},
+         "$setOnInsert": {"createdAt": now, "role": "user", "providerId": "password"}},
+        upsert=True
+    )
+
+    try:
+        _init_firebase_admin()
+        fb_auth.update_user(uid, password=new_password)
+    except Exception as e:
+        return jsonify({"error": f"Password update failed: {e}"}), 500
+
+    db.password_resets.update_one({"token": token}, {"$set": {"used": True, "usedAt": now}})
+
+    body = f"""
+    <p style="margin:0 0 10px 0;">Hi,</p>
+    <p style="margin:0 0 10px 0;">
+      Your Zenith Learning password has been successfully updated for <b>{email}</b>.
+    </p>
+    <p style="margin:0 0 10px 0;">
+      If you didn’t make this change, please reset your password again immediately and contact support.
+    </p>
+    """
+    html = _brand_email(
+        "Your password was updated",
+        "Your password reset is complete.",
+        body,
+        primary_cta={"label": "Login to Zenith", "url": _safe_public_url("/login")},
+        secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")}
+    )
+    _send_email(email, "Zenith Learning — Password updated", html)
+    return jsonify({"ok": True})
+
+@app.route("/contact", methods=["POST"])
+def contact_send():
+    data = request.get_json() or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    subject = (data.get("subject") or "Contact request").strip()
+    message = (data.get("message") or "").strip()
+
+    if not name or not email or not message:
+        return jsonify({"error": "name, email and message are required"}), 400
+
+    # Admin mail
+    admin_subject = f"[Zenith Contact] {subject}"
+    body_admin = f"""
+    <p style="margin:0 0 10px 0;">You received a new message from the Zenith Contact form.</p>
+    <table style="border-collapse:collapse;font-size:14px;">
+      <tr><td style="padding:6px 10px;border:1px solid #e5e7eb;"><b>Name</b></td><td style="padding:6px 10px;border:1px solid #e5e7eb;">{name}</td></tr>
+      <tr><td style="padding:6px 10px;border:1px solid #e5e7eb;"><b>Email</b></td><td style="padding:6px 10px;border:1px solid #e5e7eb;">{email}</td></tr>
+      <tr><td style="padding:6px 10px;border:1px solid #e5e7eb;"><b>Subject</b></td><td style="padding:6px 10px;border:1px solid #e5e7eb;">{subject}</td></tr>
+    </table>
+    <p style="margin:12px 0 6px 0;"><b>Message:</b></p>
+    <div style="white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;padding:12px;">{message}</div>
+    """
+    html_admin = _brand_email(
+        "New Contact Form Message",
+        "A user submitted a message via the Contact page.",
+        body_admin,
+        primary_cta={"label": "Open Zenith", "url": _safe_public_url("/")},
+    )
+    _send_email(ADMIN_EMAIL, admin_subject, html_admin)
+
+    # User acknowledgement
+    body_user = f"""
+    <p style="margin:0 0 10px 0;">Hi <b>{name}</b>,</p>
+    <p style="margin:0 0 10px 0;">
+      Thanks for reaching out to <b>Zenith Learning</b>. We’ve received your message and our team will respond as soon as possible.
+    </p>
+    """
+    html_user = _brand_email(
+        "We received your message",
+        "Thanks for contacting Zenith Learning — we’ll reply soon.",
+        body_user,
+        primary_cta={"label": "Back to Zenith", "url": _safe_public_url("/")},
+    )
+    _send_email(email, "Zenith Learning — We received your message", html_user)
+
+    return jsonify({"ok": True})
 
 
 # ----------------- PROFILE (EXTRA FIELDS + LOCAL PHOTO) -----------------
@@ -503,7 +1167,16 @@ def course_state_save():
 
     db = get_db()
     now = datetime.now(timezone.utc)
+
+
     h = formdata_hash(formData)
+
+    # ✅ Detect first-time course creation (for enrolled email)
+    existing_course = db.course_states.find_one(
+        {"uid": user["uid"], "courseTitle": courseTitle, "formHash": h},
+        projection={"_id": 1}
+    )
+
 
     db.course_states.update_one(
         {"uid": user["uid"], "courseTitle": courseTitle, "formHash": h},
@@ -511,6 +1184,38 @@ def course_state_save():
          "$setOnInsert": {"createdAt": now}},
         upsert=True
     )
+
+
+    # ✅ Course enrolled email (send only on first insert)
+    if not existing_course:
+        try:
+            to_email = user.get("email") or ""
+            course_id = hashlib.sha1(f"{user['uid']}|{courseTitle}|{h}".encode("utf-8")).hexdigest()[:12]
+            body = f"""
+            <p style="margin:0 0 10px 0;">Hi <b>{(user.get('name') or 'there')}</b>,</p>
+            <p style="margin:0 0 10px 0;">
+              You’re enrolled in a new course on <b>Zenith Learning</b>.
+              Your roadmap and videos are ready.
+            </p>
+            <ul style="margin:10px 0 10px 20px;">
+              <li><b>Course:</b> {courseTitle}</li>
+              <li><b>Course ID:</b> {course_id}</li>
+              <li><b>Quiz Result Time (IST):</b> {_now_ist_str()}</li>
+            </ul>
+            <p style="margin:10px 0 0 0;">Open the course to continue:</p>
+            """
+            open_url = _safe_public_url(f"/course/{courseTitle}/form")
+            html = _brand_email(
+                "Course enrolled — your roadmap is ready",
+                f"You enrolled in {courseTitle}. Open your roadmap and start learning.",
+                body,
+                primary_cta={"label": "Open course", "url": open_url},
+                secondary_cta={"label": "View My Courses", "url": _safe_public_url("/my-courses")}
+            )
+            _send_email(to_email, f"Zenith Learning — Enrolled: {courseTitle}", html)
+        except Exception:
+            pass
+
 
     return jsonify({"ok": True})
 
@@ -533,23 +1238,47 @@ def course_state_delete():
         return jsonify({"error": "courseTitle missing"}), 400
 
     uid = user.get("uid")
+
+    # ✅ send unenrolled mail (before deleting data)
+    try:
+        to_email = (user.get("email") or "").strip()
+        uname = user.get("name") or "there"
+        when_ist = _now_ist_str()
+
+        body = f"""
+        <p style="margin:0 0 10px 0;">Hi <b>{uname}</b>,</p>
+        <p style="margin:0 0 10px 0;">
+          You have discontinued (unenrolled) from the course below on <b>Zenith Learning</b>.
+        </p>
+        <ul style="margin:10px 0 10px 20px;">
+          <li><b>Course:</b> {course_title}</li>
+          <li><b>Unenrolled at:</b> {when_ist}</li>
+        </ul>
+        <p style="margin:10px 0 0 0;">
+          You can enroll again anytime from <b>My Courses</b>.
+        </p>
+        """
+
+        html = _brand_email(
+            "Course discontinued (Unenrolled)",
+            "You have been unenrolled from a course on Zenith Learning.",
+            body,
+            primary_cta={"label": "View My Courses", "url": _safe_public_url("/my-courses")},
+            secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")}
+        )
+        _send_email(to_email, f"Zenith Learning — Unenrolled: {course_title}", html)
+    except Exception:
+        pass
+
     db = get_db()
 
-    # Main state
     db.course_states.delete_many({"uid": uid, "courseTitle": course_title})
-    # Video watch progress
     db.progress.delete_many({"uid": uid, "courseTitle": course_title})
-    # Quiz progress per video
     db.quiz_progress.delete_many({"uid": uid, "courseTitle": course_title})
-    # Cached quizzes
     db.quizzes.delete_many({"uid": uid, "courseTitle": course_title})
-    # Holds (if any)
     db.course_holds.delete_many({"uid": uid, "courseTitle": course_title})
 
     return jsonify({"ok": True})
-
-
-
 @app.route("/courses/list", methods=["GET"])
 def courses_list():
     user, err = require_user()
@@ -861,7 +1590,18 @@ def admin_delete_user():
     if admin_user.get("uid") == target_uid:
         return jsonify({"error": "You cannot delete your own account."}), 400
 
-    db = get_db()
+        db = get_db()
+
+    # ✅ fetch user's email + name before deletion
+    target_doc = db.users.find_one(
+        {"uid": target_uid},
+        projection={"_id": 0, "email": 1, "name": 1}
+    ) or {}
+
+    target_email = (target_doc.get("email") or "").strip()
+    target_name = (target_doc.get("name") or "there")
+
+    # ✅ delete user data
     db.users.delete_one({"uid": target_uid})
     db.course_states.delete_many({"uid": target_uid})
     db.course_progress.delete_many({"uid": target_uid})
@@ -871,7 +1611,34 @@ def admin_delete_user():
     db.summaries.delete_many({"uid": target_uid})
     db.course_holds.delete_many({"uid": target_uid})
 
+    # ✅ send account removed email (after deletion is ok, but use saved email)
+    try:
+        when_ist = _now_ist_str()
+        body = f"""
+        <p style="margin:0 0 10px 0;">Hi <b>{target_name}</b>,</p>
+        <p style="margin:0 0 10px 0;">
+          Your <b>Zenith Learning</b> account has been removed by the administrator.
+        </p>
+        <ul style="margin:10px 0 10px 20px;">
+          <li><b>Removed at:</b> {when_ist}</li>
+        </ul>
+        <p style="margin:10px 0 0 0;">
+          If you believe this was a mistake, please contact support.
+        </p>
+        """
+        html = _brand_email(
+            "Your Zenith account has been removed",
+            "Your account was removed by the administrator.",
+            body,
+            primary_cta={"label": "Contact support", "url": _safe_public_url("/contact")},
+            secondary_cta={"label": "Open Zenith", "url": _safe_public_url("/")}
+        )
+        _send_email(target_email, "Zenith Learning — Account removed", html)
+    except Exception:
+        pass
+
     return jsonify({"ok": True, "uid": target_uid})
+
 
 
 # ----------------- ADMIN: HOLD / UNHOLD COURSE FOR USER -----------------
@@ -896,6 +1663,8 @@ def admin_course_hold():
 
     db = get_db()
     now = datetime.now(timezone.utc)
+
+
     db.course_holds.update_one(
         {"uid": uid, "courseTitle": courseTitle},
         {"$set": {"uid": uid, "courseTitle": courseTitle, "held": held, "updatedAt": now},
@@ -1127,6 +1896,8 @@ def progress_upsert():
     db = get_db()
     now = datetime.now(timezone.utc)
 
+
+
     db.progress.update_one(
         {"uid": user["uid"], "courseTitle": courseTitle},
         {"$set": {f"progressByVideo.{videoUrl}": progress, "updatedAt": now},
@@ -1211,6 +1982,8 @@ def course_progress_save():
     db = get_db()
     now = datetime.now(timezone.utc)
 
+
+
     db.course_progress.update_one(
         {"uid": user["uid"], "courseTitle": courseTitle},
         {"$set": {
@@ -1226,6 +1999,66 @@ def course_progress_save():
          "$setOnInsert": {"createdAt": now}},
         upsert=True,
     )
+
+
+    # ✅ Course completion email (send once when all quizzes/videos are completed)
+    try:
+        # determine total videos from course_states
+        cs = db.course_states.find_one({"uid": user["uid"], "courseTitle": courseTitle}, projection={"_id": 0, "videos": 1}) or {}
+        def _count_videos(obj):
+            if obj is None:
+                return 0
+            if isinstance(obj, list):
+                return sum(_count_videos(it) for it in obj)
+            if isinstance(obj, dict):
+                if isinstance(obj.get("videos"), list):
+                    return len(obj.get("videos"))
+                if "video" in obj and ("topic" in obj or "title" in obj):
+                    return 1
+                return sum(_count_videos(v) for v in obj.values())
+            return 0
+        total_videos = _count_videos(cs.get("videos"))
+        passed_count = sum(1 for k,v in (quizPassedMap or {}).items() if v)
+        completed_count = sum(1 for k,v in (quizCompletedMap or {}).items() if v)
+
+        is_complete = (total_videos > 0) and (passed_count >= total_videos or completed_count >= total_videos)
+        if is_complete:
+            # Avoid duplicates
+            course_key = hashlib.sha1(f"{user['uid']}|{courseTitle}".encode("utf-8")).hexdigest()
+            already = db.course_completion_mails.find_one({"courseKey": course_key}, projection={"_id": 1})
+            if not already:
+                db.course_completion_mails.insert_one({"courseKey": course_key, "uid": user["uid"], "courseTitle": courseTitle, "createdAt": now})
+                to_email = user.get("email") or ""
+                body = f"""
+                <p style="margin:0 0 10px 0;">Hi <b>{(user.get('name') or 'there')}</b>,</p>
+                <p style="margin:0 0 10px 0;">
+                  Congratulations — you have completed the course <b>{courseTitle}</b> on Zenith Learning 🎉
+                </p>
+                <ul style="margin:10px 0 10px 20px;">
+                  <li><b>Total videos:</b> {total_videos}</li>
+                  <li><b>Quizzes passed:</b> {passed_count}</li>
+                  <li><b>Completed items:</b> {completed_count}</li>
+                </ul>
+                <p style="margin:10px 0 10px 0;">
+                  Next steps:
+                </p>
+                <ul style="margin:10px 0 10px 20px;">
+                  <li>Review your notes and revise weak areas</li>
+                  <li>Try a new roadmap with a higher difficulty or faster pace</li>
+                  <li>Share feedback through the Contact page</li>
+                </ul>
+                """
+                html = _brand_email(
+                    "Course completed ✅",
+                    f"You completed {courseTitle}. Keep the momentum going.",
+                    body,
+                    primary_cta={"label": "View My Courses", "url": _safe_public_url("/my-courses")},
+                    secondary_cta={"label": "Start a new course", "url": _safe_public_url("/")}
+                )
+                _send_email(to_email, f"Zenith Learning — Course Completed: {courseTitle}", html)
+    except Exception:
+        pass
+
 
     return jsonify({"ok": True})
 
@@ -2359,24 +3192,26 @@ def submit_quiz():
             return jsonify({"error": "answers must be a list"}), 400
 
         db = get_db()
+
         quiz_doc = db.quizzes.find_one({"uid": user["uid"], "quiz_id": quiz_id})
         if not quiz_doc:
             return jsonify({"error": "Invalid quiz_id"}), 400
 
-        # ✅ Hold enforcement (derive course by stored video_url if needed)
+        # derive course title if not provided
         if not courseTitle:
-            courseTitle = derive_course_title_from_video(user.get("uid"), quiz_doc.get("video_url") or "") or ""
+            courseTitle = derive_course_title_from_video(
+                user.get("uid"), (quiz_doc.get("video_url") or "")
+            ) or ""
+
+        # block if course is held
         if courseTitle:
             blocked = block_if_held(user.get("uid"), courseTitle)
             if blocked:
                 return blocked
+
         used = int(quiz_doc.get("attempts_used", 0))
-
         full_quiz = quiz_doc.get("full_quiz", [])
-        if not full_quiz:
-            return jsonify({"error": "Quiz data not found"}), 500
 
-        # Evaluate
         score = 0
         results = []
         for i, q in enumerate(full_quiz):
@@ -2400,11 +3235,86 @@ def submit_quiz():
 
         required = max(1, math.ceil(len(full_quiz) * PASS_PERCENT))
         passed = score >= required
+
+        # ✅ SEND QUIZ RESULT EMAIL (VIDEO = COURSE VIDEO NUMBER like 4/32, not YouTube id)
+        try:
+            to_email = (user.get("email") or "").strip()
+            if to_email:
+                status_line = "PASSED ✅" if passed else "NEEDS REATTEMPT ⚠️"
+                video_url = (quiz_doc.get("video_url") or "").strip()
+
+                # ✅ prefer frontend-provided video number (avoids off-by-one / ordering mismatches)
+                req_video_no = data.get("video_no") or data.get("videoNo")
+                req_total_videos = data.get("total_videos") or data.get("totalVideos")
+                try:
+                    req_video_no = int(req_video_no) if req_video_no is not None else None
+                except Exception:
+                    req_video_no = None
+                try:
+                    req_total_videos = int(req_total_videos) if req_total_videos is not None else None
+                except Exception:
+                    req_total_videos = None
+
+                # ✅ derive video number (e.g., 4) and total (e.g., 32)
+                video_no, total_videos = derive_video_number_from_course(
+                    db=db,
+                    uid=user.get("uid"),
+                    course_title=courseTitle,
+                    video_url=video_url
+                )
+
+                # If frontend provided a video number/total, trust it
+                if req_video_no:
+                    video_no = req_video_no
+                if req_total_videos:
+                    total_videos = req_total_videos
+
+                # fallback
+                youtube_id = _yt_id(video_url)
+
+                video_label = f"#{video_no}" if video_no else (youtube_id or "N/A")
+                video_label_full = (
+                    f"{video_no}/{total_videos}"
+                    if (video_no and total_videos)
+                    else (str(video_no) if video_no else "N/A")
+                )
+
+                body = f"""
+                <p style="margin:0 0 10px 0;">Hi <b>{user.get('name') or 'there'}</b>,</p>
+                <p style="margin:0 0 10px 0;">Your quiz has been evaluated and your result is ready.</p>
+
+                <ul style="margin:10px 0 10px 20px;">
+                  <li><b>Course:</b> {courseTitle or 'N/A'}</li>
+                  <li><b>Status:</b> <b>{status_line}</b></li>
+                  <li><b>Score:</b> {score}/{len(full_quiz)} (Pass mark: {required})</li>
+                  <li><b>Quiz Result Time (IST):</b> {_now_ist_str()}</li>
+                  <li><b>Attempts used:</b> {used}</li>
+                  <li><b>Video No:</b> {video_label_full}</li>
+                  <li><b>Video:</b> {video_label}</li>
+                  <li><b>Video Link:</b> {video_url or 'N/A'}</li>
+                </ul>
+                """
+
+                html = _brand_email(
+                    f"Quiz completed — {status_line}",
+                    f"Course: {courseTitle or 'N/A'} • Score: {score}/{len(full_quiz)} • Video: {video_label}",
+                    body,
+                    primary_cta={"label": "View My Courses", "url": _safe_public_url("/my-courses")},
+                    secondary_cta={"label": "Open Contact", "url": _safe_public_url("/contact")}
+                )
+
+                _send_email(
+                    to_email,
+                    f"Zenith Learning — Quiz Result ({status_line})",
+                    html
+                )
+        except Exception:
+            pass
+
         return jsonify({
             "score": score,
             "total": len(full_quiz),
             "required": required,
-            "pass_percent": PASS_PERCENT,
             "passed": passed,
             "attempts_used": used,
             "results": results
@@ -2412,6 +3322,8 @@ def submit_quiz():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
 
 # ---------------- CHAT (CONTINUOUS) ----------------
 CHAT_SESSIONS = {}   # conversation_id -> list of messages
