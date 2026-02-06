@@ -342,31 +342,58 @@ def _send_email_sync_mailgun(to_email: str, subject: str, html_body: str, text_b
 
 
 
-def _send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
-    """Queue email sending to avoid blocking web requests.
+def _is_render_env() -> bool:
+    """Detect Render hosted environment."""
+    return bool(
+        os.getenv("RENDER")  # sometimes "true"
+        or os.getenv("RENDER_SERVICE_ID")
+        or os.getenv("RENDER_EXTERNAL_URL")
+        or os.getenv("RENDER_INSTANCE_ID")
+    )
 
-    Hosted platforms (like Render/Heroku) often have strict request timeouts.
-    We send on a background thread so endpoints return quickly.
-    Priority:
-      1) Mailgun API if MAILGUN_API_KEY and MAILGUN_DOMAIN are set
-      2) SendGrid API if SENDGRID_API_KEY is set
-      3) SMTP otherwise
+def _preferred_mail_provider() -> str:
+    """
+    Decide which email provider to use:
+      - Localhost/dev: SMTP
+      - Render: Mailgun
+    Override with MAIL_PROVIDER=smtp|mailgun if you want.
+    """
+    override = os.getenv("MAIL_PROVIDER", "").strip().lower()
+    if override in ("smtp", "mailgun"):
+        return override
+    return "mailgun" if _is_render_env() else "smtp"
+
+def _send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
+    """Send email on a background thread.
+
+    Behavior requested:
+      - When running locally (localhost/dev) -> SMTP
+      - When hosted on Render -> Mailgun
+
+    Fallback order (only if the preferred provider is not configured):
+      - If preferred is Mailgun: try Mailgun -> SendGrid (if configured) -> SMTP
+      - If preferred is SMTP: try SMTP only
     """
     if not to_email:
         return
 
-    def _job():
-        # Prefer Mailgun if configured (most reliable on hosted platforms).
-        if os.getenv("MAILGUN_API_KEY", "").strip() and os.getenv("MAILGUN_DOMAIN", "").strip():
-            if _send_email_sync_mailgun(to_email, subject, html_body, text_body):
-                return
+    provider = _preferred_mail_provider()
 
-        # Next prefer SendGrid if configured.
+    def _job():
+        if provider == "smtp":
+            _send_email_sync_smtp(to_email, subject, html_body, text_body)
+            return
+
+        # provider == "mailgun"
+        if _send_email_sync_mailgun(to_email, subject, html_body, text_body):
+            return
+
+        # Optional fallback: SendGrid if configured
         if os.getenv("SENDGRID_API_KEY", "").strip():
             if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
                 return
 
-        # Fallback: SMTP (may be blocked on some hosts).
+        # Last fallback: SMTP (may be blocked on some hosts)
         _send_email_sync_smtp(to_email, subject, html_body, text_body)
 
     try:
@@ -375,13 +402,10 @@ def _send_email(to_email: str, subject: str, html_body: str, text_body: str = ""
         t.start()
     except Exception as e:
         print("[MAIL] Could not spawn mail thread:", e)
-        # Fall back to sync (still with small timeouts).
-        if os.getenv("SENDGRID_API_KEY", "").strip():
-            if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
-                return
-        _send_email_sync_smtp(to_email, subject, html_body, text_body)
+        # Worst-case: run inline.
+        _job()
 
-def _brand_email(title: str, preheader: str, body_html: str, primary_cta: dict = None, secondary_cta: dict = None):
+def _brand_email(title: str, preheader: str = "", body_html: str = "", primary_cta: dict = None, secondary_cta: dict = None):
     """Return a professional, branded email HTML."""
     logo_text = "Zenith Learning"
     year = datetime.now().year
@@ -681,50 +705,50 @@ def auth_firebase():
     if not uid:
         return jsonify({"error": "uid missing"}), 400
 
+
     db = get_db()
     now = datetime.now(timezone.utc)
 
-    # ✅ Ensure Mongo user doc exists (manual signup may verify before first login)
-    try:
-        db.users.update_one(
-            {"uid": uid},
+    # ✅ Canonicalize by email to avoid duplicate Mongo users when the same person logs in via password + SSO.
+    email_norm = (email or "").strip().lower()
+    if email_norm:
+        # Upsert by email (unique), then attach latest Firebase uid/provider/name/photo
+        res = db.users.update_one(
+            {"email": email_norm},
             {"$set": {
                 "uid": uid,
-                "email": email,
-                "name": (user.get("name") or ""),
-                "photoURL": (user.get("picture") or user.get("photoURL") or ""),
-                "providerId": "password",
+                "email": email_norm,
+                "name": name,
+                "photoURL": photoURL,
+                "providerId": providerId,
                 "updatedAt": now,
-            }, "$setOnInsert": {"createdAt": now, "role": "user"}},
+            },
+             # role ONLY on first insert
+             "$setOnInsert": {"createdAt": now, "role": "user"}},
             upsert=True
         )
-    except Exception as e:
-        print(f"[WARN] Mongo upsert during send-verification failed: {e}")
-
-
-    res = db.users.update_one(
-        {"uid": uid},
-        {"$set": {
-            "uid": uid,
-            "email": email,
-            "name": name,
-            "photoURL": photoURL,
-            "providerId": providerId,
-            "updatedAt": now,
-        },
-         # ✅ IMPORTANT:
-         # We MUST NOT overwrite an existing role (e.g., you manually set role="admin" in Atlas).
-         # So role is set ONLY on first insert.
-         "$setOnInsert": {"createdAt": now, "role": "user"}},
-        upsert=True
-    )
+    else:
+        # Fallback (rare): no email available -> upsert by uid
+        res = db.users.update_one(
+        {"email": (email or "").strip().lower()} if (email or "").strip() else {"uid": uid},
+            {"$set": {
+                "uid": uid,
+                "email": email_norm,
+                "name": name,
+                "photoURL": photoURL,
+                "providerId": providerId,
+                "updatedAt": now,
+            },
+             "$setOnInsert": {"createdAt": now, "role": "user"}},
+            upsert=True
+        )
 
     # ✅ Send welcome email for SSO (Google) only for first-time sign-in
     try:
         is_new = bool(getattr(res, "upserted_id", None))
         if is_new and (providerId or "").lower().startswith("google"):
             # Avoid duplicates if user doc already has the flag
-            udoc = db.users.find_one({"uid": uid}, projection={"_id": 0, "welcomeSsoSent": 1, "name": 1}) or {}
+            udoc = db.users.find_one({"email": (email or "").strip().lower()} if (email or "").strip() else {"uid": uid}, projection={"_id": 0, "welcomeSsoSent": 1, "name": 1}) or {}
             if not udoc.get("welcomeSsoSent"):
                 home_url = _safe_public_url("/")
                 body = f"""
@@ -747,12 +771,12 @@ def auth_firebase():
                     secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")}
                 )
                 _send_email(email, "Welcome to Zenith Learning", html)
-                db.users.update_one({"uid": uid}, {"$set": {"welcomeSsoSent": True, "updatedAt": now}})
+                db.users.update_one({"email": (email or "").strip().lower()} if (email or "").strip() else {"uid": uid}, {"$set": {"welcomeSsoSent": True, "updatedAt": now}})
     except Exception as _e:
         pass
 
 
-    user_doc = db.users.find_one({"uid": uid}, {"_id": 0})
+    user_doc = db.users.find_one({"email": (email or "").strip().lower()} if (email or "").strip() else {"uid": uid}, {"_id": 0})
     return jsonify({
         "ok": True,
         "user": user_doc
@@ -783,13 +807,15 @@ def auth_send_verification():
     db = get_db()
     now = datetime.now(timezone.utc)
 
-    # ✅ Ensure Mongo user doc exists (manual signup may verify before first login)
+    # ✅ Ensure Mongo user doc exists (canonical by email to prevent duplicates)
     try:
+        email_norm = (email or "").strip().lower()
+        filt = {"email": email_norm} if email_norm else {"uid": uid}
         db.users.update_one(
-            {"uid": uid},
+            filt,
             {"$set": {
                 "uid": uid,
-                "email": email,
+                "email": email_norm,
                 "name": (user.get("name") or ""),
                 "photoURL": (user.get("picture") or user.get("photoURL") or ""),
                 "providerId": "password",
@@ -799,7 +825,6 @@ def auth_send_verification():
         )
     except Exception as e:
         print(f"[WARN] Mongo upsert during send-verification failed: {e}")
-
 
     # If already verified, avoid re-sending
     try:
@@ -887,7 +912,7 @@ def auth_verify_email():
     db.email_verifications.update_one({"token": token}, {"$set": {"used": True, "usedAt": now}})
 
     # Welcome email for manual signup (send only once)
-    user_doc = db.users.find_one({"uid": uid}, projection={"_id": 0}) or {}
+    user_doc = db.users.find_one({"email": (email or "").strip().lower()} if (email or "").strip() else {"uid": uid}, projection={"_id": 0}) or {}
     if not user_doc.get("welcomeManualSent"):
         home_url = _safe_public_url("/")
         body = f"""
@@ -914,7 +939,7 @@ def auth_verify_email():
             secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")}
         )
         _send_email(email, "Welcome to Zenith Learning", html)
-        db.users.update_one({"uid": uid}, {"$set": {"welcomeManualSent": True, "updatedAt": now}}, upsert=True)
+        db.users.update_one({"email": (email or "").strip().lower()} if (email or "").strip() else {"uid": uid}, {"$set": {"welcomeManualSent": True, "updatedAt": now}}, upsert=True)
 
     return jsonify({"ok": True})
 
@@ -1785,7 +1810,10 @@ def admin_delete_user():
     target_name = (target_doc.get("name") or "there")
 
     # ✅ delete user data
+    # remove user doc (uid is stored on the canonical email doc)
     db.users.delete_one({"uid": target_uid})
+    if target_email:
+        db.users.delete_one({"email": target_email.strip().lower()})
     db.course_states.delete_many({"uid": target_uid})
     db.course_progress.delete_many({"uid": target_uid})
     db.progress.delete_many({"uid": target_uid})
@@ -1793,6 +1821,20 @@ def admin_delete_user():
     db.transcripts.delete_many({"uid": target_uid})
     db.summaries.delete_many({"uid": target_uid})
     db.course_holds.delete_many({"uid": target_uid})
+
+
+    # ✅ delete from Firebase Auth too
+    try:
+        _init_firebase_admin()
+        try:
+            fb_auth.delete_user(target_uid)
+        except Exception:
+            # fallback: if uid not found but email exists, try delete by email
+            if target_email:
+                u = fb_auth.get_user_by_email(target_email)
+                fb_auth.delete_user(u.uid)
+    except Exception as e:
+        print(f"[WARN] Firebase delete failed for {target_uid}: {e}")
 
     # ✅ send account removed email (after deletion is ok, but use saved email)
     try:
