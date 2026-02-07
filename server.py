@@ -1155,6 +1155,116 @@ def contact_send():
 
 
 # ----------------- PROFILE (EXTRA FIELDS + LOCAL PHOTO) -----------------
+# --- Profile update email helpers ---
+_PROFILE_FIELD_LABELS = {
+    "name": "Name",
+    "dob": "Date of Birth",
+    "education": "Education",
+    "college": "College",
+    "degree": "Degree",
+    "department": "Department",
+    "yearBatch": "Batch / Year",
+    "year": "Year",
+    "phone": "Phone",
+    "location": "Location",
+    "bio": "Bio",
+    "photoURL": "Profile Photo (URL)",
+    "photoLocalURL": "Profile Photo",
+}
+
+def _norm_profile_val(v):
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v.strip()
+    # keep numbers/bools as-is but stringify for comparisons
+    return str(v).strip()
+
+def _profile_change_rows(before: dict, after_partial: dict):
+    """
+    Compute change rows ONLY for fields present in `after_partial` (i.e., what client attempted to write).
+    Returns list of dicts: {field,label,change,old,new}
+    """
+    rows = []
+    before = before or {}
+    for k, new_v in (after_partial or {}).items():
+        if k in ("updatedAt",):
+            continue
+        old_v = _norm_profile_val(before.get(k, ""))
+        new_vn = _norm_profile_val(new_v)
+        if old_v == new_vn:
+            continue
+
+        if old_v and not new_vn:
+            change = "Deleted"
+        elif (not old_v) and new_vn:
+            change = "Added"
+        else:
+            change = "Updated"
+
+        rows.append({
+            "field": k,
+            "label": _PROFILE_FIELD_LABELS.get(k, k),
+            "change": change,
+            "old": old_v,
+            "new": new_vn,
+        })
+    return rows
+
+def _send_profile_update_email(to_email: str, name: str, rows: list, when_ist: str, cta_url: str = ""):
+    """Send a profile update email listing only changed fields."""
+    if not to_email or not rows:
+        return
+
+    # Build rows table
+    tr_html = ""
+    for r in rows:
+        new_disp = r["new"] if r["change"] != "Deleted" else "—"
+        # Avoid super-long bio blobs in email tables
+        if r["field"] == "bio" and len(new_disp) > 140:
+            new_disp = new_disp[:140].rstrip() + "…"
+        if r["field"] in ("photoLocalURL", "photoURL"):
+            # don't dump long urls; indicate status
+            if r["change"] == "Deleted":
+                new_disp = "Removed"
+            else:
+                new_disp = "Updated"
+
+        tr_html += f"""
+        <tr>
+          <td style="padding:8px 10px;border:1px solid #e5e7eb;"><b>{r['label']}</b></td>
+          <td style="padding:8px 10px;border:1px solid #e5e7eb;">{r['change']}</td>
+          <td style="padding:8px 10px;border:1px solid #e5e7eb;word-break:break-word;">{new_disp}</td>
+        </tr>
+        """
+
+    body = f"""
+    <p style="margin:0 0 10px 0;">Hi <b>{(name or 'there').strip()}</b>,</p>
+    <p style="margin:0 0 12px 0;">Your Zenith profile was updated on <b>{when_ist}</b>. Here’s what changed:</p>
+
+    <table style="border-collapse:collapse;font-size:14px;width:100%;max-width:560px;">
+      <tr>
+        <td style="padding:8px 10px;border:1px solid #e5e7eb;background:#f9fafb;"><b>Field</b></td>
+        <td style="padding:8px 10px;border:1px solid #e5e7eb;background:#f9fafb;"><b>Change</b></td>
+        <td style="padding:8px 10px;border:1px solid #e5e7eb;background:#f9fafb;"><b>New value</b></td>
+      </tr>
+      {tr_html}
+    </table>
+
+    <p style="margin:14px 0 0 0;color:#6b7280;font-size:13px;">
+      If you didn’t make this change, please reset your password and contact support.
+    </p>
+    """
+
+    html = _brand_email(
+        "Profile updated",
+        "Your Zenith profile details were updated.",
+        body,
+        primary_cta={"label": "Open Profile", "url": (cta_url or _safe_public_url("/profile"))},
+    )
+    _send_email(to_email, "Zenith Learning — Profile updated", html)
+
+
 @app.route("/profile/me", methods=["GET"])
 def profile_me_get():
     user, err = require_user()
@@ -1191,6 +1301,7 @@ def profile_me_post():
         "photoLocalURL",
     ]
     update = {k: (data.get(k) or "") for k in allowed if k in data}
+
     # Normalize strings
     for k, v in list(update.items()):
         if isinstance(v, str):
@@ -1202,12 +1313,37 @@ def profile_me_post():
 
     # Keep empty strings out (optional) except name
     update["name"] = (update.get("name") or "").strip()
+
+    db = get_db()
+    uid = user["uid"]
+
+    # Read previous state so we can email ONLY what changed
+    before = db.users.find_one({"uid": uid}, {"_id": 0}) or {}
+
+    # Compute change rows BEFORE we add updatedAt
+    rows = _profile_change_rows(before, update)
+
     now = datetime.now(timezone.utc)
     update["updatedAt"] = now
 
-    db = get_db()
-    db.users.update_one({"uid": user["uid"]}, {"$set": update}, upsert=True)
-    doc = db.users.find_one({"uid": user["uid"]}, {"_id": 0})
+    db.users.update_one({"uid": uid}, {"$set": update}, upsert=True)
+    doc = db.users.find_one({"uid": uid}, {"_id": 0})
+
+    # Send profile update email (only if there were changes)
+    try:
+        to_email = (user.get("email") or (doc or {}).get("email") or before.get("email") or "").strip()
+        display_name = (doc or {}).get("name") or update.get("name") or before.get("name") or ""
+        if to_email and rows:
+            _send_profile_update_email(
+                to_email=to_email,
+                name=display_name,
+                rows=rows,
+                when_ist=_now_ist_str(),
+                cta_url=_safe_public_url("/profile"),
+            )
+    except Exception as e:
+        print("[MAIL] profile update email failed:", e)
+
     return jsonify({"ok": True, "user": doc})
 
 
@@ -1279,7 +1415,6 @@ def profile_photo_upload():
     _, ext = os.path.splitext(original)
     ext = (ext or "").lower()
     if not ext:
-        # Try to infer from mimetype
         mt = (f.mimetype or "").lower()
         if "jpeg" in mt or "jpg" in mt:
             ext = ".jpg"
@@ -1291,35 +1426,63 @@ def profile_photo_upload():
     if ext not in ALLOWED_IMAGE_EXTS:
         return jsonify({"error": "Only JPG / PNG / WEBP allowed"}), 400
 
+    # Read current avatar state (for delete + email diff)
+    current = db.users.find_one(
+        {"uid": uid},
+        {"_id": 0, "avatarFileId": 1, "photoLocalURL": 1, "email": 1, "name": 1}
+    ) or {}
+
     # Replace existing avatar (GridFS) if present
-    current = db.users.find_one({"uid": uid}, {"_id": 0, "avatarFileId": 1}) or {}
     old_fid = current.get("avatarFileId")
     if old_fid:
         try:
             fs.delete(ObjectId(old_fid))
-        except:
+        except Exception:
             pass
 
-    # Store in GridFS (more reliable on hosting than local disk)
+    # Store in GridFS
     content_type = (f.mimetype or "").strip() or "application/octet-stream"
     file_id = fs.put(f.stream.read(), filename=f"avatar_{uid}{ext}", contentType=content_type)
     public_url = _profile_avatar_url(uid)
 
-    # Also clean any old local file leftovers
+    # Clean any old local file leftovers
     _remove_existing_avatar_files(uid)
 
+    now = datetime.now(timezone.utc)
     db.users.update_one(
         {"uid": uid},
         {"$set": {
             "avatarFileId": str(file_id),
             "photoLocalURL": public_url,
             "photoURL": "",
-            "updatedAt": datetime.now(timezone.utc)
+            "updatedAt": now
         }},
         upsert=True,
     )
-    doc = db.users.find_one({"uid": user["uid"]}, {"_id": 0})
+
+    doc = db.users.find_one({"uid": uid}, {"_id": 0}) or {}
+
+    # ✅ Send email: profile photo updated (only mention photo)
+    try:
+        before = current or {}
+        rows = _profile_change_rows(before, {"photoLocalURL": public_url})
+
+        to_email = (user.get("email") or doc.get("email") or before.get("email") or "").strip()
+        display_name = (doc.get("name") or before.get("name") or user.get("name") or "").strip()
+
+        if to_email and rows:
+            _send_profile_update_email(
+                to_email=to_email,
+                name=display_name,
+                rows=rows,
+                when_ist=_now_ist_str(),
+                cta_url=_safe_public_url("/profile"),
+            )
+    except Exception as e:
+        print("[MAIL] profile photo upload email failed:", e)
+
     return jsonify({"ok": True, "user": doc})
+
 
 
 @app.route("/profile/photo", methods=["DELETE"])
@@ -1333,26 +1496,52 @@ def profile_photo_delete():
     db = get_db()
     fs = gridfs.GridFS(db)
 
+    # Read current avatar state (for email diff)
+    current = db.users.find_one(
+        {"uid": uid},
+        {"_id": 0, "avatarFileId": 1, "photoLocalURL": 1, "email": 1, "name": 1}
+    ) or {}
+
     # Delete from GridFS if present
-    current = db.users.find_one({"uid": uid}, {"_id": 0, "avatarFileId": 1}) or {}
     old_fid = current.get("avatarFileId")
     if old_fid:
         try:
             fs.delete(ObjectId(old_fid))
-        except:
+        except Exception:
             pass
 
     # Also remove any local leftovers
     _remove_existing_avatar_files(uid)
 
+    now = datetime.now(timezone.utc)
     db.users.update_one(
         {"uid": uid},
-        {"$set": {"photoLocalURL": "", "photoURL": "", "avatarFileId": "", "updatedAt": datetime.now(timezone.utc)}},
+        {"$set": {"photoLocalURL": "", "photoURL": "", "avatarFileId": "", "updatedAt": now}},
         upsert=True,
     )
-    doc = db.users.find_one({"uid": uid}, {"_id": 0})
-    return jsonify({"ok": True, "user": doc})
 
+    doc = db.users.find_one({"uid": uid}, {"_id": 0}) or {}
+
+    # ✅ Send email: profile photo deleted (only mention photo)
+    try:
+        before = current or {}
+        rows = _profile_change_rows(before, {"photoLocalURL": ""})
+
+        to_email = (user.get("email") or doc.get("email") or before.get("email") or "").strip()
+        display_name = (doc.get("name") or before.get("name") or user.get("name") or "").strip()
+
+        if to_email and rows:
+            _send_profile_update_email(
+                to_email=to_email,
+                name=display_name,
+                rows=rows,
+                when_ist=_now_ist_str(),
+                cta_url=_safe_public_url("/profile"),
+            )
+    except Exception as e:
+        print("[MAIL] profile photo delete email failed:", e)
+
+    return jsonify({"ok": True, "user": doc})
 
 # ----------------- COURSE STATE CACHE (ROADMAP + VIDEOS) -----------------
 @app.route("/course/state/get", methods=["POST"])
