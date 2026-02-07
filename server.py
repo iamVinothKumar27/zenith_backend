@@ -44,6 +44,19 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import re
+# ----------------- PASSWORD REUSE PREVENTION -----------------
+PASSWORD_PEPPER = os.getenv("PASSWORD_PEPPER", "").strip()  # set this in .env (random long string)
+
+def _pw_hash(uid: str, password: str) -> str:
+    """
+    Hash password so we can detect reuse.
+    Uses SHA-256 with uid + server-side pepper.
+    NOTE: This is NOT used for authentication; only reuse detection.
+    """
+    uid = (uid or "").strip()
+    password = (password or "").strip()
+    raw = f"{uid}|{PASSWORD_PEPPER}|{password}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 def _yt_id(url: str) -> str:
     """Extract YouTube ID from watch?v= or youtu.be links."""
@@ -1014,7 +1027,6 @@ def auth_password_reset_confirm():
     db = get_db()
     now = datetime.now(timezone.utc)
 
-
     rec = db.password_resets.find_one({"token": token})
     if not rec:
         return jsonify({"error": "Invalid or expired token"}), 400
@@ -1024,10 +1036,13 @@ def auth_password_reset_confirm():
     if exp and isinstance(exp, datetime) and exp < now:
         return jsonify({"error": "Token expired"}), 400
 
-    uid = rec.get("uid")
-    email = rec.get("email")
+    uid = (rec.get("uid") or "").strip()
+    email = (rec.get("email") or "").strip().lower()
 
-    # ✅ Ensure user exists in MongoDB even if the user verified before first login
+    if not uid:
+        return jsonify({"error": "Invalid reset record (uid missing)"}), 400
+
+    # ✅ Ensure user exists in MongoDB
     db.users.update_one(
         {"uid": uid},
         {"$set": {"uid": uid, "email": email, "updatedAt": now},
@@ -1035,14 +1050,42 @@ def auth_password_reset_confirm():
         upsert=True
     )
 
+    # ✅ Prevent using the same password again (compare with stored hash)
+    try:
+        user_doc = db.users.find_one({"uid": uid}, projection={"_id": 0, "passwordHash": 1}) or {}
+        old_hash = (user_doc.get("passwordHash") or "").strip()
+        new_hash = _pw_hash(uid, new_password)
+
+        # If we have old hash and it's same => block
+        if old_hash and old_hash == new_hash:
+            return jsonify({
+                "error": "New password cannot be the same as your old password. Please choose a different password."
+            }), 400
+    except Exception:
+        # don't fail reset if hash check fails unexpectedly
+        pass
+
+    # ✅ Update Firebase password
     try:
         _init_firebase_admin()
         fb_auth.update_user(uid, password=new_password)
     except Exception as e:
         return jsonify({"error": f"Password update failed: {e}"}), 500
 
+    # ✅ Mark token used
     db.password_resets.update_one({"token": token}, {"$set": {"used": True, "usedAt": now}})
 
+    # ✅ Save latest password hash (for next-time reuse detection)
+    try:
+        db.users.update_one(
+            {"uid": uid},
+            {"$set": {"passwordHash": _pw_hash(uid, new_password), "updatedAt": now}},
+            upsert=True
+        )
+    except Exception:
+        pass
+
+    # ✅ Confirmation email
     body = f"""
     <p style="margin:0 0 10px 0;">Hi,</p>
     <p style="margin:0 0 10px 0;">
