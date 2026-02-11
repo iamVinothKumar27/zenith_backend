@@ -171,26 +171,72 @@ SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
-MAIL_FROM = (os.getenv("MAIL_FROM") or os.getenv("SMTP_FROM") or SMTP_USER).strip()  # e.g. no-reply@zenithlearning.site
+
+# ✅ Sender aliases (Google Workspace / Gmail "Send mail as")
+# These should be configured as aliases for your primary mailbox (SMTP_USER).
+MAIL_FROM_DEFAULT = (os.getenv("MAIL_FROM_DEFAULT") or os.getenv("MAIL_FROM") or os.getenv("SMTP_FROM") or SMTP_USER).strip()
+MAIL_FROM_AUTH = (os.getenv("MAIL_FROM_AUTH") or "authentication@zenithlearning.site").strip()
+MAIL_FROM_COURSES = (os.getenv("MAIL_FROM_COURSES") or "courses@zenithlearning.site").strip()
+MAIL_FROM_PROFILE = (os.getenv("MAIL_FROM_PROFILE") or "profile@zenithlearning.site").strip()
+MAIL_FROM_ADMIN = (os.getenv("MAIL_FROM_ADMIN") or "admin@zenithlearning.site").strip()
+MAIL_FROM_CONTACT = (os.getenv("MAIL_FROM_CONTACT") or "contact@zenithlearning.site").strip()
+
+# Optional: use SendGrid API instead of SMTP (kept for safety, but Mailgun removed)
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
-SENDGRID_FROM = os.getenv("SENDGRID_FROM", "").strip()  # optional; defaults to MAIL_FROM\n\nFRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", os.getenv("FRONTEND_URL", "")).strip().rstrip("/")
+SENDGRID_FROM = os.getenv("SENDGRID_FROM", "").strip()
+
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", os.getenv("FRONTEND_URL", "")).strip().rstrip("/")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@zenithlearning.site").strip()
+CONTACT_INBOX = os.getenv("CONTACT_INBOX", "contact@zenithlearning.site").strip()
+
 
 def _smtp_ready() -> bool:
-    return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and MAIL_FROM)
+    return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS)
 
-def _send_email_sync_smtp(to_email: str, subject: str, html_body: str, text_body: str = "") -> bool:
-    """Send email via SMTP. Returns True if sent, False otherwise."""
+def _pick_from(kind: str = "") -> str:
+    k = (kind or "").strip().lower()
+    if k in ("auth", "authentication", "login"):
+        return MAIL_FROM_AUTH or MAIL_FROM_DEFAULT
+    if k in ("courses", "course", "quiz"):
+        return MAIL_FROM_COURSES or MAIL_FROM_DEFAULT
+    if k in ("profile",):
+        return MAIL_FROM_PROFILE or MAIL_FROM_DEFAULT
+    if k in ("admin",):
+        return MAIL_FROM_ADMIN or MAIL_FROM_DEFAULT
+    if k in ("contact",):
+        return MAIL_FROM_CONTACT or MAIL_FROM_DEFAULT
+    return MAIL_FROM_DEFAULT or SMTP_USER
+
+def _send_email_sync_smtp(
+    to_email: str,
+    subject: str,
+    html_body: str,
+    text_body: str = "",
+    *,
+    from_email: str = None,
+    reply_to: str = None,
+) -> bool:
+    """Send email via SMTP. Returns True if sent, False otherwise.
+
+    Notes:
+    - When using Google Workspace SMTP, authenticate with SMTP_USER (primary mailbox),
+      and set From to one of its verified aliases (courses@, profile@, etc.).
+    - For contact form, prefer setting Reply-To to the user's email.
+    """
     if not to_email:
         return False
     if not _smtp_ready():
         print("[MAIL] SMTP not configured. Skipping send to:", to_email, "subject:", subject)
         return False
 
+    sender = (from_email or MAIL_FROM_DEFAULT or SMTP_USER).strip()
+
     msg = MIMEMultipart("alternative")
-    msg["From"] = f"Zenith Learning <{MAIL_FROM}>"
+    msg["From"] = f"Zenith Learning <{sender}>"
     msg["To"] = to_email
     msg["Subject"] = subject
+    if reply_to:
+        msg["Reply-To"] = reply_to
 
     if text_body:
         msg.attach(MIMEText(text_body, "plain", "utf-8"))
@@ -199,6 +245,7 @@ def _send_email_sync_smtp(to_email: str, subject: str, html_body: str, text_body
     # Keep timeouts low to avoid Gunicorn worker timeouts on hosted deployments.
     connect_timeout = int(os.getenv("SMTP_TIMEOUT", "8"))
 
+    server = None
     try:
         if int(SMTP_PORT) == 465:
             server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=connect_timeout)
@@ -210,22 +257,21 @@ def _send_email_sync_smtp(to_email: str, subject: str, html_body: str, text_body
                 server.starttls()
                 server.ehlo()
             except Exception:
-                # Some providers don't require STARTTLS on certain ports.
                 pass
 
         server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(MAIL_FROM, [to_email], msg.as_string())
+        server.sendmail(sender, [to_email], msg.as_string())
         server.quit()
-        print("[MAIL] SMTP Sent:", subject, "->", to_email)
+        print("[MAIL] SMTP Sent:", subject, "->", to_email, "| from:", sender)
         return True
     except Exception as e:
         print("[MAIL] SMTP Send failed:", e)
         try:
-            server.quit()
+            if server:
+                server.quit()
         except Exception:
             pass
         return False
-
 
 def _send_email_sync_sendgrid(to_email: str, subject: str, html_body: str, text_body: str = "") -> bool:
     """Send email via SendGrid Web API. Returns True if accepted by SendGrid."""
@@ -365,49 +411,30 @@ def _is_render_env() -> bool:
     )
 
 def _preferred_mail_provider() -> str:
-    """
-    Decide which email provider to use:
-      - Localhost/dev: SMTP
-      - Render: Mailgun
-    Override with MAIL_PROVIDER=smtp|mailgun if you want.
-    """
-    override = os.getenv("MAIL_PROVIDER", "").strip().lower()
-    if override in ("smtp", "mailgun"):
-        return override
-    return "mailgun" if _is_render_env() else "smtp"
+    """Always use SMTP (Google Workspace)."""
+    return "smtp"
 
-def _send_email(to_email: str, subject: str, html_body: str, text_body: str = ""):
-    """Send email on a background thread.
-
-    Behavior requested:
-      - When running locally (localhost/dev) -> SMTP
-      - When hosted on Render -> Mailgun
-
-    Fallback order (only if the preferred provider is not configured):
-      - If preferred is Mailgun: try Mailgun -> SendGrid (if configured) -> SMTP
-      - If preferred is SMTP: try SMTP only
-    """
+def _send_email(
+    to_email: str,
+    subject: str,
+    html_body: str,
+    text_body: str = "",
+    *,
+    kind: str = "",
+    reply_to: str = None,
+):
+    """Send email on a background thread (SMTP only)."""
     if not to_email:
         return
 
-    provider = _preferred_mail_provider()
+    from_email = _pick_from(kind)
 
     def _job():
-        if provider == "smtp":
-            _send_email_sync_smtp(to_email, subject, html_body, text_body)
-            return
-
-        # provider == "mailgun"
-        if _send_email_sync_mailgun(to_email, subject, html_body, text_body):
-            return
-
-        # Optional fallback: SendGrid if configured
+        # Optional fallback: SendGrid if configured (useful if SMTP is blocked by host)
         if os.getenv("SENDGRID_API_KEY", "").strip():
             if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
                 return
-
-        # Last fallback: SMTP (may be blocked on some hosts)
-        _send_email_sync_smtp(to_email, subject, html_body, text_body)
+        _send_email_sync_smtp(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to)
 
     try:
         import threading
@@ -415,7 +442,6 @@ def _send_email(to_email: str, subject: str, html_body: str, text_body: str = ""
         t.start()
     except Exception as e:
         print("[MAIL] Could not spawn mail thread:", e)
-        # Worst-case: run inline.
         _job()
 
 def _brand_email(title: str, preheader: str = "", body_html: str = "", primary_cta: dict = None, secondary_cta: dict = None):
@@ -576,16 +602,14 @@ def require_user():
 
 
 def require_admin():
-    """Verify token + check the user's role in MongoDB."""
+    """Verify token + allow only the fixed admin mailbox (ADMIN_EMAIL)."""
     user, err = require_user()
     if err:
         return None, err
 
     try:
-        db = get_db()
-        doc = db.users.find_one({"uid": user.get("uid")}, projection={"_id": 0, "role": 1})
-        role = (doc or {}).get("role") or "user"
-        if role != "admin":
+        email = (user.get("email") or "").strip().lower()
+        if email != (ADMIN_EMAIL or "").strip().lower():
             return None, ("Admin access required", 403)
         return user, None
     except Exception as e:
@@ -737,7 +761,7 @@ def auth_firebase():
                 "updatedAt": now,
             },
              # role ONLY on first insert
-             "$setOnInsert": {"createdAt": now, "role": "user"}},
+             "$setOnInsert": {"createdAt": now}},
             upsert=True
         )
     else:
@@ -752,7 +776,7 @@ def auth_firebase():
                 "providerId": providerId,
                 "updatedAt": now,
             },
-             "$setOnInsert": {"createdAt": now, "role": "user"}},
+             "$setOnInsert": {"createdAt": now}},
             upsert=True
         )
 
@@ -783,7 +807,7 @@ def auth_firebase():
                     primary_cta={"label": "Start learning", "url": home_url},
                     secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")}
                 )
-                _send_email(email, "Welcome to Zenith Learning", html)
+                _send_email(email, "Welcome to Zenith Learning", html, kind="auth")
                 db.users.update_one({"email": (email or "").strip().lower()} if (email or "").strip() else {"uid": uid}, {"$set": {"welcomeSsoSent": True, "updatedAt": now}})
     except Exception as _e:
         pass
@@ -833,7 +857,7 @@ def auth_send_verification():
                 "photoURL": (user.get("picture") or user.get("photoURL") or ""),
                 "providerId": "password",
                 "updatedAt": now,
-            }, "$setOnInsert": {"createdAt": now, "role": "user"}},
+            }, "$setOnInsert": {"createdAt": now}},
             upsert=True
         )
     except Exception as e:
@@ -878,7 +902,7 @@ def auth_send_verification():
         body,
         primary_cta={"label": "Open verification page", "url": verify_url},
     )
-    _send_email(email, "Verify your Zenith Learning email", html)
+    _send_email(email, "Verify your Zenith Learning email", html, kind="auth")
     return jsonify({"ok": True})
 
 @app.route("/auth/verify-email", methods=["POST"])
@@ -912,7 +936,7 @@ def auth_verify_email():
     db.users.update_one(
         {"uid": uid},
         {"$set": {"uid": uid, "email": email, "updatedAt": now},
-         "$setOnInsert": {"createdAt": now, "role": "user", "providerId": "password"}},
+         "$setOnInsert": {"createdAt": now, "providerId": "password"}},
         upsert=True
     )
 
@@ -951,7 +975,7 @@ def auth_verify_email():
             primary_cta={"label": "Go to Zenith", "url": home_url},
             secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")}
         )
-        _send_email(email, "Welcome to Zenith Learning", html)
+        _send_email(email, "Welcome to Zenith Learning", html, kind="auth")
         db.users.update_one({"email": (email or "").strip().lower()} if (email or "").strip() else {"uid": uid}, {"$set": {"welcomeManualSent": True, "updatedAt": now}}, upsert=True)
 
     return jsonify({"ok": True})
@@ -1011,7 +1035,7 @@ def auth_password_reset_request():
         body,
         primary_cta={"label": "Reset password", "url": reset_url},
     )
-    _send_email(email, "Reset your Zenith Learning password", html)
+    _send_email(email, "Reset your Zenith Learning password", html, kind="auth")
     return jsonify({"ok": True})
 
 @app.route("/auth/password-reset/confirm", methods=["POST"])
@@ -1046,7 +1070,7 @@ def auth_password_reset_confirm():
     db.users.update_one(
         {"uid": uid},
         {"$set": {"uid": uid, "email": email, "updatedAt": now},
-         "$setOnInsert": {"createdAt": now, "role": "user", "providerId": "password"}},
+         "$setOnInsert": {"createdAt": now, "providerId": "password"}},
         upsert=True
     )
 
@@ -1102,7 +1126,7 @@ def auth_password_reset_confirm():
         primary_cta={"label": "Login to Zenith", "url": _safe_public_url("/login")},
         secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")}
     )
-    _send_email(email, "Zenith Learning — Password updated", html)
+    _send_email(email, "Zenith Learning — Password updated", html, kind="auth")
     return jsonify({"ok": True})
 
 @app.route("/contact", methods=["POST"])
@@ -1134,7 +1158,7 @@ def contact_send():
         body_admin,
         primary_cta={"label": "Open Zenith", "url": _safe_public_url("/")},
     )
-    _send_email(ADMIN_EMAIL, admin_subject, html_admin)
+    _send_email(CONTACT_INBOX, admin_subject, html_admin, kind="contact", reply_to=email)
 
     # User acknowledgement
     body_user = f"""
@@ -1149,7 +1173,7 @@ def contact_send():
         body_user,
         primary_cta={"label": "Back to Zenith", "url": _safe_public_url("/")},
     )
-    _send_email(email, "Zenith Learning — We received your message", html_user)
+    _send_email(email, "Zenith Learning — We received your message", html_user, kind="contact")
 
     return jsonify({"ok": True})
 
@@ -1262,7 +1286,7 @@ def _send_profile_update_email(to_email: str, name: str, rows: list, when_ist: s
         body,
         primary_cta={"label": "Open Profile", "url": (cta_url or _safe_public_url("/profile"))},
     )
-    _send_email(to_email, "Zenith Learning — Profile updated", html)
+    _send_email(to_email, "Zenith Learning — Profile updated", html, kind="profile")
 
 
 @app.route("/profile/me", methods=["GET"])
@@ -1652,7 +1676,7 @@ def course_state_save():
                 primary_cta={"label": "Open course", "url": open_url},
                 secondary_cta={"label": "View My Courses", "url": _safe_public_url("/my-courses")}
             )
-            _send_email(to_email, f"Zenith Learning — Enrolled: {courseTitle}", html)
+            _send_email(to_email, f"Zenith Learning — Enrolled: {courseTitle}", html, kind="courses")
         except Exception:
             pass
 
@@ -1706,7 +1730,7 @@ def course_state_delete():
             primary_cta={"label": "View My Courses", "url": _safe_public_url("/my-courses")},
             secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")}
         )
-        _send_email(to_email, f"Zenith Learning — Unenrolled: {course_title}", html)
+        _send_email(to_email, f"Zenith Learning — Unenrolled: {course_title}", html, kind="courses")
     except Exception:
         pass
 
@@ -1892,18 +1916,21 @@ def admin_users():
             return 0
         return sum(1 for _, v in dct.items() if bool(v))
 
-    users_out = []
-    for u in db.users.find({}, projection={"_id": 0, "uid": 1, "email": 1, "name": 1, "role": 1}):
-        uid = u.get("uid")
-        role = u.get("role") or "user"
+    admin_email_lc = (ADMIN_EMAIL or "").strip().lower()
 
-        # ✅ Requirement: do not show learning progress for admin accounts
-        if role == "admin":
+    users_out = []
+    for u in db.users.find({}, projection={"_id": 0, "uid": 1, "email": 1, "name": 1}):
+        uid = u.get("uid")
+        email = (u.get("email") or "").strip()
+        is_admin = email.lower() == admin_email_lc
+
+        # ✅ Do not show learning progress for the admin mailbox
+        if is_admin:
             users_out.append({
                 "uid": uid,
-                "email": u.get("email"),
+                "email": email,
                 "name": u.get("name"),
-                "role": role,
+                "isAdmin": True,
                 "courses": [],
                 "overallPercent": 0,
                 "heldCourses": [],
@@ -1913,6 +1940,7 @@ def admin_users():
         states = list(db.course_states.find({"uid": uid}, projection={"_id": 0, "courseTitle": 1, "videos": 1}))
         holds = list(db.course_holds.find({"uid": uid, "held": True}, projection={"_id": 0, "courseTitle": 1}))
         held_set = set([h.get("courseTitle") for h in holds if h.get("courseTitle")])
+
         courses = []
         percents = []
         for st in states:
@@ -1936,78 +1964,27 @@ def admin_users():
         overall = round(sum(percents) / len(percents), 2) if percents else 0
         users_out.append({
             "uid": uid,
-            "email": u.get("email"),
+            "email": email,
             "name": u.get("name"),
-            "role": role,
+            "isAdmin": False,
             "courses": courses,
             "overallPercent": overall,
             "heldCourses": sorted(list(held_set)),
         })
 
-    users_out.sort(key=lambda x: (x.get("role") != "admin", x.get("email") or ""))
-    return jsonify({"ok": True, "users": users_out})
+    users_out.sort(key=lambda x: (not x.get("isAdmin"), x.get("email") or ""))
+    return jsonify({"ok": True, "adminEmail": ADMIN_EMAIL, "users": users_out})
 
 
 # ----------------- ADMIN: ROLE MANAGEMENT -----------------
 @app.route("/admin/promote", methods=["POST"])
 def admin_promote():
-    """Promote a user to admin.
-
-    Body: {"uid": "<firebase uid>"} OR {"email": "<email>"}
-    """
-    admin_user, err = require_admin()
-    if err:
-        msg, code = err
-        return jsonify({"error": msg}), code
-
-    data = request.get_json() or {}
-    target_uid = (data.get("uid") or "").strip()
-    target_email = (data.get("email") or "").strip().lower()
-    if not target_uid and not target_email:
-        return jsonify({"error": "uid or email required"}), 400
-
-    db = get_db()
-    q = {"uid": target_uid} if target_uid else {"email": target_email}
-    doc = db.users.find_one(q, projection={"_id": 0, "uid": 1, "email": 1, "role": 1})
-    if not doc:
-        return jsonify({"error": "User not found"}), 404
-
-    db.users.update_one(q, {"$set": {"role": "admin", "updatedAt": datetime.now(timezone.utc)}})
-    return jsonify({"ok": True, "uid": doc.get("uid"), "role": "admin"})
+    return jsonify({"error": "Role management removed. Admin is fixed to ADMIN_EMAIL."}), 410
 
 
 @app.route("/admin/demote", methods=["POST"])
 def admin_demote():
-    """Demote an admin back to user.
-
-    Body: {"uid": "<firebase uid>"} OR {"email": "<email>"}
-    Safety: an admin cannot demote themselves.
-    """
-    admin_user, err = require_admin()
-    if err:
-        msg, code = err
-        return jsonify({"error": msg}), code
-
-    data = request.get_json() or {}
-    target_uid = (data.get("uid") or "").strip()
-    target_email = (data.get("email") or "").strip().lower()
-    if not target_uid and not target_email:
-        return jsonify({"error": "uid or email required"}), 400
-
-    # Prevent self-demotion (avoids locking yourself out)
-    if target_uid and admin_user.get("uid") == target_uid:
-        return jsonify({"error": "You cannot demote your own account."}), 400
-    if target_email and (admin_user.get("email") or "").lower() == target_email:
-        return jsonify({"error": "You cannot demote your own account."}), 400
-
-    db = get_db()
-    q = {"uid": target_uid} if target_uid else {"email": target_email}
-    doc = db.users.find_one(q, projection={"_id": 0, "uid": 1, "email": 1, "role": 1})
-    if not doc:
-        return jsonify({"error": "User not found"}), 404
-
-    db.users.update_one(q, {"$set": {"role": "user", "updatedAt": datetime.now(timezone.utc)}})
-    return jsonify({"ok": True, "uid": doc.get("uid"), "role": "user"})
+    return jsonify({"error": "Role management removed. Admin is fixed to ADMIN_EMAIL."}), 410
 
 
 # ----------------- ADMIN: DELETE USER -----------------
@@ -2090,7 +2067,7 @@ def admin_delete_user():
             primary_cta={"label": "Contact support", "url": _safe_public_url("/contact")},
             secondary_cta={"label": "Open Zenith", "url": _safe_public_url("/")}
         )
-        _send_email(target_email, "Zenith Learning — Account removed", html)
+        _send_email(target_email, "Zenith Learning — Account removed", html, kind="admin")
     except Exception:
         pass
 
@@ -2128,6 +2105,37 @@ def admin_course_hold():
          "$setOnInsert": {"createdAt": now}},
         upsert=True,
     )
+
+    # ✅ Notify user (admin action)
+    try:
+        udoc = db.users.find_one({"uid": uid}, projection={"_id": 0, "email": 1, "name": 1}) or {}
+        to_email = (udoc.get("email") or "").strip()
+        if to_email:
+            uname = udoc.get("name") or "there"
+            status = "ON HOLD" if held else "ACTIVE"
+            body = f"""
+            <p style="margin:0 0 10px 0;">Hi <b>{uname}</b>,</p>
+            <p style="margin:0 0 10px 0;">
+              Your course access has been updated by the admin on <b>Zenith Learning</b>.
+            </p>
+            <ul style="margin:10px 0 10px 20px;">
+              <li><b>Course:</b> {courseTitle}</li>
+              <li><b>Status:</b> <b>{status}</b></li>
+              <li><b>Updated at (IST):</b> {_now_ist_str()}</li>
+            </ul>
+            <p style="margin:10px 0 0 0;">If you think this is a mistake, contact support.</p>
+            """
+            html = _brand_email(
+                f"Course status updated — {status}",
+                f"Course: {courseTitle} • Status: {status}",
+                body,
+                primary_cta={"label": "Open My Courses", "url": _safe_public_url("/my-courses")},
+                secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")},
+            )
+            _send_email(to_email, f"Zenith Learning — Course {status}: {courseTitle}", html, kind="admin")
+    except Exception:
+        pass
+
     return jsonify({"ok": True, "uid": uid, "courseTitle": courseTitle, "held": held})
 
 
@@ -2207,7 +2215,7 @@ def admin_course_progress():
             return 0
         return sum(1 for _, v in dct.items() if bool(v))
 
-    users = {u["uid"]: u for u in db.users.find({}, projection={"_id": 0, "uid": 1, "email": 1, "name": 1, "role": 1})}
+    users = {u["uid"]: u for u in db.users.find({}, projection={"_id": 0, "uid": 1, "email": 1, "name": 1})}
 
     # quiz progress is stored in course_progress collection
     rows = []
@@ -2215,10 +2223,8 @@ def admin_course_progress():
         uid = cp.get("uid")
         ct = cp.get("courseTitle")
         u = users.get(uid) or {}
-        role = (u.get("role") or "user")
-
-        # ✅ Requirement: do not show progress rows for admins
-        if role == "admin":
+        email_lc = (u.get("email") or "").strip().lower()
+        if email_lc == (ADMIN_EMAIL or "").strip().lower():
             continue
 
         total = int(totals.get(ct, 0))
@@ -2229,8 +2235,7 @@ def admin_course_progress():
             "uid": uid,
             "name": u.get("name"),
             "email": u.get("email"),
-            "role": role,
-            "courseTitle": ct,
+                        "courseTitle": ct,
             "totalQuizzes": total,
             "passedQuizzes": passed,
             "percent": pct,
@@ -2512,7 +2517,7 @@ def course_progress_save():
                     primary_cta={"label": "View My Courses", "url": _safe_public_url("/my-courses")},
                     secondary_cta={"label": "Start a new course", "url": _safe_public_url("/")}
                 )
-                _send_email(to_email, f"Zenith Learning — Course Completed: {courseTitle}", html)
+                _send_email(to_email, f"Zenith Learning — Course Completed: {courseTitle}", html, kind="courses")
     except Exception:
         pass
 
@@ -3763,7 +3768,8 @@ def submit_quiz():
                 _send_email(
                     to_email,
                     f"Zenith Learning — Quiz Result ({status_line})",
-                    html
+                    html,
+                    kind="courses"
                 )
         except Exception:
             pass
@@ -3779,7 +3785,6 @@ def submit_quiz():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 
 # ---------------- CHAT (CONTINUOUS) ----------------
@@ -4010,6 +4015,7 @@ User question:
         if is_quota_error(e):
             return jsonify({"error": "Gemini quota exceeded. Please try later or enable billing."}), 429
         return jsonify({"error": str(e)}), 500
+
 
 
 if __name__ == "__main__":
