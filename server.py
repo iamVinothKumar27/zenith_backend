@@ -2665,6 +2665,47 @@ def is_quota_error(e: Exception) -> bool:
     msg = str(e).lower()
     return ("429" in msg) or ("quota" in msg) or ("rate limit" in msg) or ("resource exhausted" in msg)
 
+def _parse_iso8601_duration_to_seconds(iso: str) -> int:
+    """
+    Convert YouTube ISO 8601 duration (e.g., PT1H2M10S, PT45S) to seconds.
+    Returns 0 if parsing fails.
+    """
+    if not iso:
+        return 0
+    iso = iso.strip().upper()
+    m = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", iso)
+    if not m:
+        return 0
+    h = int(m.group(1) or 0)
+    mi = int(m.group(2) or 0)
+    s = int(m.group(3) or 0)
+    return h * 3600 + mi * 60 + s
+
+
+def _looks_like_shorts(title: str, duration_sec: int, video_url: str = "") -> bool:
+    t = (title or "").lower()
+    u = (video_url or "").lower()
+    # Heuristics: YouTube Shorts are typically <= 60s, and often tagged in title
+    if "/shorts/" in u:
+        return True
+    if "#shorts" in t or " shorts" in t or t.endswith("shorts"):
+        return True
+    if duration_sec and duration_sec <= 60:
+        return True
+    return False
+
+
+def _extract_topic_keywords(topic: str) -> set:
+    t = re.sub(r"[^a-z0-9\s]", " ", (topic or "").lower())
+    words = [w for w in t.split() if len(w) > 2]
+    stop = {
+        "the", "and", "for", "with", "from", "that", "this", "into", "your", "you",
+        "are", "was", "were", "can", "will", "what", "why", "how", "when", "where",
+        "about", "using", "use", "tutorial", "course", "learn", "learning",
+        "beginner", "advanced", "english", "in", "to", "of", "on", "a", "an"
+    }
+    return {w for w in words if w not in stop}
+
 def get_gemini_response(input_prompt: str) -> str:
     model = genai.GenerativeModel("gemini-2.5-flash")
     response = model.generate_content(input_prompt)
@@ -3238,6 +3279,12 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
                 published = item.get("snippet", {}).get("publishedAt", "")
                 video_url = f"https://www.youtube.com/watch?v={video_id}"
 
+                # Defaults (in case API omits fields)
+                duration_sec = 0
+                iso_dur = ""
+                _skip_shorts = False
+
+
                 # Fetch video statistics with retry
                 stats = {}
                 last_err = None
@@ -3249,8 +3296,20 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
                             id=video_id
                         ).execute()
                         if video_data.get("items"):
-                            stats = video_data["items"][0].get("statistics", {}) or {}
-                        break
+                            item0 = video_data["items"][0] or {}
+                            stats = item0.get("statistics", {}) or {}
+                            content_details = item0.get("contentDetails", {}) or {}
+                            iso_dur = (content_details.get("duration") or "").strip()
+                            duration_sec = _parse_iso8601_duration_to_seconds(iso_dur)
+
+                            # Filter Shorts / very short videos
+                            if _looks_like_shorts(title, duration_sec, video_url):
+                                print(f"  [SKIP-SHORTS] id={video_id} dur={duration_sec}s title={title[:60]}")
+                                stats = {}
+                                _skip_shorts = True
+                            else:
+                                _skip_shorts = False
+                            break
                     except HttpError as e:
                         last_err = e
                         if e.resp.status in [500, 503]:
@@ -3262,6 +3321,10 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
 
                 if last_err and not stats:
                     print(f"  [STATS-FAIL] id={video_id} err={str(last_err)}")
+                    continue
+
+                # If we skipped due to Shorts, continue
+                if locals().get('_skip_shorts'):
                     continue
 
                 like_count = int(stats.get("likeCount", 0) or 0)
@@ -3276,7 +3339,9 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
                     "publishedAt": published,
                     "like_count": like_count,
                     "view_count": view_count,
-                    "comment_count": comment_count
+                    "comment_count": comment_count,
+                    "duration_sec": duration_sec,
+                    "duration_iso": iso_dur
                 })
 
                 # ✅ This print line matches your older style
@@ -3304,17 +3369,47 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
 
     return video_details
 
-def get_best_video(topic):
-    # ✅ consistent with your old logic: take first result
-    video_list = get_video_details(topic, max_results=2)
-    print("here")  # same marker you used earlier
+def get_best_video(query: str, used_video_ids: set = None, blocked_keywords: set = None):
+    """Pick a non-Shorts YouTube video for a query, avoiding repeats and topic overlap."""
+    used_video_ids = used_video_ids or set()
+    blocked_keywords = blocked_keywords or set()
+
+    # pull more candidates so filters have room to work
+    video_list = get_video_details(query, max_results=12)
+    print("here")  # keep your old marker
     if not video_list:
         return None
-    return video_list[0]["url"]
+
+    def _contains_blocked(title: str) -> bool:
+        t = (title or "").lower()
+        for kw in blocked_keywords:
+            if kw and kw in t:
+                return True
+        return False
+
+    for v in video_list:
+        vid = v.get("video_id") or _yt_id(v.get("url", ""))
+        if not vid:
+            continue
+        if vid in used_video_ids:
+            continue
+        if _contains_blocked(v.get("title", "")):
+            continue
+        return v
+
+    # fallback: allow overlap but still avoid duplicates
+    for v in video_list:
+        vid = v.get("video_id") or _yt_id(v.get("url", ""))
+        if vid and vid not in used_video_ids:
+            return v
+    return None
 
 def build_weekly_json(roadmap):
     weeks = parse_roadmap(roadmap)
     result = []
+
+    used_video_ids = set()      # avoid recommending same video across topics
+    covered_keywords = set()    # reduce topic overlap between consecutive topics
 
     print("\n=========== BUILD WEEKLY JSON START ===========")
     for week, topics in weeks.items():
@@ -3324,11 +3419,26 @@ def build_weekly_json(roadmap):
             q = topic + " in english"
             print(f"  -> ({idx}) Topic: {topic}")
             print(f"     Query: {q}")
-            video = get_best_video(q)
-            week_data.append({"topic": topic, "video": video if video else "No video found"})
-        result.append({week: week_data})
-    print("\n=========== BUILD WEEKLY JSON END ===========\n")
 
+            cur_kw = _extract_topic_keywords(topic)
+            blocked = covered_keywords - cur_kw
+
+            best = get_best_video(q, used_video_ids=used_video_ids, blocked_keywords=blocked)
+
+            if best and best.get("url"):
+                url = best["url"]
+                vid = best.get("video_id") or _yt_id(url)
+                if vid:
+                    used_video_ids.add(vid)
+            else:
+                url = None
+
+            week_data.append({"topic": topic, "video": url if url else "No video found"})
+            covered_keywords |= cur_kw
+
+        result.append({week: week_data})
+
+    print("\n=========== BUILD WEEKLY JSON END ===========\n")
     return result
 
 @app.route("/generate-roadmap", methods=["POST"])
@@ -3405,6 +3515,11 @@ def get_transcript():
 def generate_mcq(transcript: str):
     prmpt = f"""You are an expert educational consultant.
 A student has given a video transcript and wants to create a multiple-choice quiz based on it.
+
+IMPORTANT LANGUAGE RULE:
+- The quiz MUST be written in ENGLISH ONLY.
+- If the transcript is not in English, translate the content to English first (internally), then generate the quiz.
+- Do NOT output any non-English text.
 
 Transcript:
 {transcript}
@@ -3978,14 +4093,32 @@ def chat_bot():
     user_input = (data.get("message") or "").strip()
     conversation_id = (data.get("conversation_id") or "").strip()
 
+    # NEW: keep chat history per-course
+    course_title = (data.get("courseTitle") or data.get("course") or subject or "").strip()
+
     if not subject or not user_input:
         return jsonify({"error": "Both 'subject' and 'message' are required"}), 400
 
     if not conversation_id:
         return jsonify({"error": "conversation_id is required"}), 400
 
-    # Load history for this conversation
-    history = CHAT_SESSIONS.get(conversation_id, [])
+    if not course_title:
+        course_title = subject
+
+    db = get_db()
+
+    # Composite key in memory; persisted in Mongo so it survives restarts
+    session_key = f"{user['uid']}::{course_title}::{conversation_id}"
+
+    # Load history
+    history = CHAT_SESSIONS.get(session_key)
+    if history is None:
+        doc = db.chat_sessions.find_one(
+            {"uid": user["uid"], "courseTitle": course_title, "conversation_id": conversation_id},
+            sort=[("updatedAt", -1)],
+            projection={"_id": 0, "history": 1}
+        )
+        history = (doc.get("history") if doc else []) or []
 
     # Add user message
     history.append({"role": "user", "content": user_input})
@@ -4026,10 +4159,18 @@ Now respond to the latest user message only.
 
         history.append({"role": "assistant", "content": reply_text})
         history = _trim_history(history)
-        CHAT_SESSIONS[conversation_id] = history
+
+        CHAT_SESSIONS[session_key] = history
+        now = datetime.now(timezone.utc)
+        db.chat_sessions.update_one(
+            {"uid": user["uid"], "courseTitle": course_title, "conversation_id": conversation_id},
+            {"$set": {"history": history, "updatedAt": now}, "$setOnInsert": {"createdAt": now}},
+            upsert=True
+        )
 
         return jsonify({
             "conversation_id": conversation_id,
+            "courseTitle": course_title,
             "reply": reply_text,
             "history_size": len(history)
         })
@@ -4037,7 +4178,6 @@ Now respond to the latest user message only.
         if is_quota_error(e):
             return jsonify({"error": "Gemini quota exceeded. Please try later or enable billing."}), 429
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/pdf/upload", methods=["POST"])
 def pdf_upload():
