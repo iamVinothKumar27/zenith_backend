@@ -172,18 +172,6 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
 
-# ----------------- MAILGUN (Render / Production) -----------------
-MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY", "").strip()
-MAILGUN_DOMAIN = os.getenv("MAILGUN_DOMAIN", "").strip()  # e.g., mg.zenithlearning.site
-MAILGUN_BASE_URL = os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net/v3").strip()
-# Default from addresses (must be authorized in Mailgun for best deliverability)
-MAILGUN_FROM_DEFAULT = os.getenv("MAILGUN_FROM_DEFAULT", "").strip()  # e.g., no-reply@zenithlearning.site
-MAILGUN_FROM_CONTACT = os.getenv("MAILGUN_FROM_CONTACT", "").strip()  # e.g., contact@zenithlearning.site
-# If you *really* want the contact emails to show From: user@example.com on Mailgun,
-# set this to "true" (not recommended; may fail SPF/DMARC or be rewritten by Gmail).
-MAILGUN_ALLOW_SPOOF_FROM = os.getenv("MAILGUN_ALLOW_SPOOF_FROM", "false").lower() in ("1","true","yes","y","on")
-
-
 # ✅ Sender aliases (Google Workspace / Gmail "Send mail as")
 # These should be configured as aliases for your primary mailbox (SMTP_USER).
 MAIL_FROM_DEFAULT = (os.getenv("MAIL_FROM_DEFAULT") or os.getenv("MAIL_FROM") or os.getenv("SMTP_FROM") or SMTP_USER).strip()
@@ -226,7 +214,6 @@ def _send_email_sync_smtp(
     text_body: str = "",
     *,
     from_email: str = None,
-    from_name: str = None,
     reply_to: str = None,
 ) -> bool:
     """Send email via SMTP. Returns True if sent, False otherwise.
@@ -245,7 +232,7 @@ def _send_email_sync_smtp(
     sender = (from_email or MAIL_FROM_DEFAULT or SMTP_USER).strip()
 
     msg = MIMEMultipart("alternative")
-    msg["From"] = f"{(from_name or 'Zenith Learning').strip()} <{sender}>"
+    msg["From"] = f"Zenith Learning <{sender}>"
     msg["To"] = to_email
     msg["Subject"] = subject
     if reply_to:
@@ -273,8 +260,7 @@ def _send_email_sync_smtp(
                 pass
 
         server.login(SMTP_USER, SMTP_PASS)
-        envelope_sender = (SMTP_USER or sender).strip()
-        server.sendmail(envelope_sender, [to_email], msg.as_string())
+        server.sendmail(sender, [to_email], msg.as_string())
         server.quit()
         print("[MAIL] SMTP Sent:", subject, "->", to_email, "| from:", sender)
         return True
@@ -415,72 +401,6 @@ def _send_email_sync_mailgun(to_email: str, subject: str, html_body: str, text_b
 
 
 
-
-def _mailgun_ready() -> bool:
-    return bool(MAILGUN_API_KEY and MAILGUN_DOMAIN)
-
-def _send_email_sync_mailgun(
-    to_email: str,
-    subject: str,
-    html_body: str,
-    text_body: str = "",
-    *,
-    from_email: str = None,
-    from_name: str = None,
-    reply_to: str = None,
-) -> bool:
-    """Send email via Mailgun HTTP API. Returns True if accepted by Mailgun."""
-    if not to_email:
-        return False
-    if not _mailgun_ready():
-        return False
-
-    # Mailgun typically requires the From domain to be authorized (to avoid DMARC/SPF issues).
-    # For contact form, we show the user's email via Reply-To (and optionally spoof if enabled).
-    sender_email = (from_email or MAILGUN_FROM_DEFAULT or MAIL_FROM_DEFAULT or SMTP_USER).strip()
-    sender_name = (from_name or "Zenith Learning").strip()
-
-    # If from_email is not on the Mailgun domain and spoofing is not allowed, rewrite it.
-    if from_email and not MAILGUN_ALLOW_SPOOF_FROM:
-        try:
-            domain = (MAILGUN_DOMAIN or "").lower().lstrip("@")
-            if "@" in from_email and from_email.split("@", 1)[1].lower() != domain:
-                # keep the user's identity in the display name
-                sender_email = (MAILGUN_FROM_CONTACT or MAILGUN_FROM_DEFAULT or sender_email).strip()
-                sender_name = f"{from_name or from_email} via Zenith"
-        except Exception:
-            pass
-
-    mg_from = f"{sender_name} <{sender_email}>"
-
-    url = f"{MAILGUN_BASE_URL.rstrip('/')}/{MAILGUN_DOMAIN}/messages"
-    data = {
-        "from": mg_from,
-        "to": to_email,
-        "subject": subject,
-        "html": html_body,
-    }
-    if text_body:
-        data["text"] = text_body
-    if reply_to:
-        # Mailgun supports custom headers with h: prefix
-        data["h:Reply-To"] = reply_to
-
-    try:
-        import requests
-        resp = requests.post(url, auth=("api", MAILGUN_API_KEY), data=data, timeout=10)
-        ok = 200 <= resp.status_code < 300
-        if ok:
-            print("[MAIL] Mailgun Sent:", subject, "->", to_email, "| from:", sender_email)
-        else:
-            print("[MAIL] Mailgun failed:", resp.status_code, resp.text[:200])
-        return ok
-    except Exception as e:
-        print("[MAIL] Mailgun Send failed:", e)
-        return False
-
-
-
 def _is_render_env() -> bool:
     """Detect Render hosted environment."""
     return bool(
@@ -490,27 +410,9 @@ def _is_render_env() -> bool:
         or os.getenv("RENDER_INSTANCE_ID")
     )
 
-
 def _preferred_mail_provider() -> str:
-    """Select mail provider.
-    - Localhost/dev: SMTP
-    - Render/prod: Mailgun (if configured), else SendGrid (if configured), else SMTP
-    You can override with EMAIL_PROVIDER=smtp|mailgun|sendgrid
-    """
-    override = os.getenv("EMAIL_PROVIDER", "").strip().lower()
-    if override in ("smtp", "mailgun", "sendgrid"):
-        return override
-
-    if _is_render_env():
-        if _mailgun_ready():
-            return "mailgun"
-        if os.getenv("SENDGRID_API_KEY", "").strip():
-            return "sendgrid"
-        return "smtp"
-
+    """Always use SMTP (Google Workspace)."""
     return "smtp"
-
-
 
 def _send_email(
     to_email: str,
@@ -520,44 +422,19 @@ def _send_email(
     *,
     kind: str = "",
     reply_to: str = None,
-    from_override: str = None,
-    from_name: str = None,
 ):
-    """Send email on a background thread (SMTP/Mailgun/SendGrid)."""
+    """Send email on a background thread (SMTP only)."""
     if not to_email:
         return
 
-    picked_from = (from_override or _pick_from(kind) or "").strip()
+    from_email = _pick_from(kind)
 
     def _job():
-        provider = _preferred_mail_provider()
-
-        if provider == "mailgun":
-            if _send_email_sync_mailgun(
-                to_email,
-                subject,
-                html_body,
-                text_body,
-                from_email=picked_from,
-                from_name=from_name,
-                reply_to=reply_to,
-            ):
-                return
-
-        if provider == "sendgrid":
+        # Optional fallback: SendGrid if configured (useful if SMTP is blocked by host)
+        if os.getenv("SENDGRID_API_KEY", "").strip():
             if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
                 return
-
-        # default: SMTP
-        _send_email_sync_smtp(
-            to_email,
-            subject,
-            html_body,
-            text_body,
-            from_email=picked_from,
-            reply_to=reply_to,
-            from_name=from_name,
-        )
+        _send_email_sync_smtp(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to)
 
     try:
         import threading
@@ -566,8 +443,6 @@ def _send_email(
     except Exception as e:
         print("[MAIL] Could not spawn mail thread:", e)
         _job()
-
-
 
 def _brand_email(title: str, preheader: str = "", body_html: str = "", primary_cta: dict = None, secondary_cta: dict = None):
     """Return a professional, branded email HTML."""
@@ -1283,7 +1158,7 @@ def contact_send():
         body_admin,
         primary_cta={"label": "Open Zenith", "url": _safe_public_url("/")},
     )
-    _send_email(CONTACT_INBOX, admin_subject, html_admin, kind="contact", reply_to=email, from_override=email, from_name=name)
+    _send_email(CONTACT_INBOX, admin_subject, html_admin, kind="contact", reply_to=email)
 
     # User acknowledgement
     body_user = f"""
