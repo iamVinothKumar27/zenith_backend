@@ -1,0 +1,18 @@
+{
+  "name": "Advanced Array Problems Sliding Window Data Structures For Placements",
+  "children": [
+    {
+      "name": "Definition & Purpose",
+      "children": [
+        {
+          "name": "What is Sliding Window?",
+          "children": [
+            {"name": "Window over linear structure", "children": []},
+            {"name": "Slides across array/string", "children": []},
+            {"name": "Processes contiguous segments", "children": []}
+          ]
+        }
+      ]
+    }
+  ]
+}

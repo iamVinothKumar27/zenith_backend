@@ -2,60 +2,84 @@
   {
     "Week 1": [
       {
-        "topic": "Advanced IP addressing CIDR VLSM Computer Networks exam",
-        "video": "https://www.youtube.com/watch?v=OqsXzkXfwRw"
+        "topic": "Advanced Array Problems Sliding Window Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=tk38CTSAYsg"
       },
       {
-        "topic": "OSPF BGP routing protocol configuration Computer Networks deep dive",
-        "video": "https://www.youtube.com/watch?v=rLNmrFh-sd8"
+        "topic": "Two Pointers Technique Interview Questions Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=Z_c4byLrNBU"
       },
       {
-        "topic": "TCP flow control congestion avoidance Computer Networks detailed",
-        "video": "https://www.youtube.com/watch?v=RBbqDGD6n1I"
+        "topic": "Advanced Linked List Problems Recursion Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=58YbpRDc4yw"
       },
       {
-        "topic": "UDP application layer reliability techniques Computer Networks",
-        "video": "https://www.youtube.com/watch?v=eB3My37Fqkc"
+        "topic": "Tree Traversal Algorithms Practice Problems Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=WLvU5EQVZqY"
       },
       {
-        "topic": "Data Link Layer error detection correction CRC Computer Networks",
-        "video": "https://www.youtube.com/watch?v=5Q-Yv6_0Qcw"
+        "topic": "Binary Search Tree Advanced Concepts For Placements",
+        "video": "https://www.youtube.com/watch?v=cySVml6e_Fc"
       },
       {
-        "topic": "Spanning Tree Protocol operation RSTP MSTP Computer Networks",
-        "video": "https://www.youtube.com/watch?v=6MW5P6Ci7lw"
+        "topic": "Heap Data Structure Priority Queue Interview Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=Qf-TDPr0nYw"
       },
       {
-        "topic": "DNS lookup process resolution Computer Networks explained",
-        "video": "https://www.youtube.com/watch?v=mpQZVYPuDGU"
+        "topic": "Trie Data Structure Implementation For Placements",
+        "video": "https://www.youtube.com/watch?v=ZjMo21L_XoE"
       },
       {
-        "topic": "HTTP HTTPS protocol deep dive Computer Networks security",
-        "video": "https://www.youtube.com/watch?v=eWdPWSBKxso"
+        "topic": "Segment Tree Fenwick Tree Tutorial Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=EMDMy9TkQGM"
       },
       {
-        "topic": "Network security principles firewalls IDS IPS Computer Networks",
-        "video": "https://www.youtube.com/watch?v=9GZlVOafYTg"
+        "topic": "Graph Algorithms BFS DFS Advanced Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=dis_c84ejhQ"
       },
       {
-        "topic": "Wireless LAN 802.11 standards frames Computer Networks",
-        "video": "https://www.youtube.com/watch?v=2slukwJzw9w"
+        "topic": "Dijkstra Floyd Warshall Bellman Ford Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=KudAWAMiQog"
       },
       {
-        "topic": "Software Defined Networking SDN NFV architecture Computer Networks",
-        "video": "https://www.youtube.com/watch?v=Z4v2zG9RlCE"
+        "topic": "Minimum Spanning Tree Algorithms For Placements",
+        "video": "https://www.youtube.com/watch?v=ZSPjZuZWCME"
       },
       {
-        "topic": "Network Address Translation NAT types troubleshooting Computer Networks",
-        "video": "https://www.youtube.com/watch?v=FTUV0t6JaDA"
+        "topic": "Dynamic Programming Patterns For Placements",
+        "video": "https://www.youtube.com/watch?v=sWnBVPRA0yQ"
       },
       {
-        "topic": "IPv6 addressing format routing Computer Networks challenges",
-        "video": "https://www.youtube.com/watch?v=Mo01x0LPxio"
+        "topic": "Advanced DP Interview Questions Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=wjFgd8JJ8NM"
       },
       {
-        "topic": "Virtual Local Area Networks VLANs Trunking Computer Networks exam",
-        "video": "https://www.youtube.com/watch?v=jC6MJTh9fRE"
+        "topic": "Backtracking Permutations Combinations Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=DKCbsiDBN6c"
+      },
+      {
+        "topic": "Greedy Algorithms Problem Solving Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=3H2G3KuEiRU"
+      },
+      {
+        "topic": "Bit Manipulation Tricks For Placements",
+        "video": "https://www.youtube.com/watch?v=G4st5-0LYso"
+      },
+      {
+        "topic": "Disjoint Set Union Advanced Problems Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=xS9EiDkrn1A"
+      },
+      {
+        "topic": "Topological Sort Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=7J3GadLzydI"
+      },
+      {
+        "topic": "LRU Cache Design Interview Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=OhCp6ppX6bg"
+      },
+      {
+        "topic": "System Design Using Data Structures For Placements",
+        "video": "https://www.youtube.com/watch?v=m8Icp_Cid5o"
       }
     ]
   }
