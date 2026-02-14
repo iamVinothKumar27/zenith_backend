@@ -3931,7 +3931,7 @@ def _pdf_cache_put(obj: dict):
         pass
 
 
-def _pdf_get(uid: str, pdf_id: str):
+def _pdf_get(uid: str, pdf_id: str, course_title: str = None):
     """Fetch PDF from in-memory cache first, then MongoDB."""
     if not pdf_id:
         return None
@@ -3943,7 +3943,10 @@ def _pdf_get(uid: str, pdf_id: str):
     db = get_db()
     if db is None:
         return None
-    doc = db.pdf_store.find_one({"pdf_id": pdf_id, "uid": uid}, projection={"_id": 0})
+    q = {"pdf_id": pdf_id, "uid": uid}
+    if course_title:
+        q["courseTitle"] = course_title
+    doc = db.pdf_store.find_one(q, projection={"_id": 0})
     if doc:
         _pdf_cache_put(doc)
     return doc
@@ -4299,9 +4302,16 @@ def pdf_chat():
     if not conversation_id:
         return jsonify({"error": "conversation_id is required"}), 400
 
-    obj = _pdf_get(user["uid"], pdf_id)
+    obj = _pdf_get(user["uid"], pdf_id, course_title)
     if not obj or obj.get("uid") != user["uid"]:
         return jsonify({"error": "PDF not found (upload again)"}), 404
+
+
+    # Enforce PDF belongs to this course
+    if (obj.get("courseTitle") or "Course") != (course_title or "Course"):
+        return jsonify({"error": "PDF does not belong to this course"}), 400
+
+
 
     chunks = obj.get("chunks") or []
     best = _simple_retrieve(chunks, question, k=6)
@@ -4443,6 +4453,61 @@ def pdf_chat_history_delete_pair():
         "history": history,
     })
 
+
+
+
+@app.route("/pdf/delete", methods=["POST"])
+def pdf_delete():
+    """Delete a PDF (pdf_store) and all its chat sessions (pdf_chat_sessions / pdf_chats) for this user + course."""
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    data = request.get_json() or {}
+    pdf_id = (data.get("pdf_id") or "").strip()
+    course_title = (data.get("courseTitle") or data.get("course") or "").strip() or "Course"
+
+    if not pdf_id:
+        return jsonify({"error": "pdf_id is required"}), 400
+
+    db = get_db()
+    if db is None:
+        return jsonify({"error": "Database not available"}), 500
+
+    q = {"uid": user["uid"], "courseTitle": course_title, "pdf_id": pdf_id}
+
+    # 1) Delete PDF content/metadata
+    r_store = db.pdf_store.delete_one(q)
+
+    # 2) Delete all chat sessions for this PDF
+    r_sessions = db.pdf_chat_sessions.delete_many(q)
+
+    # 3) Backward-compat: if an older collection name exists, delete there too
+    deleted_pdf_chats = 0
+    try:
+        r_legacy = db["pdf_chats"].delete_many(q)
+        deleted_pdf_chats = getattr(r_legacy, "deleted_count", 0) or 0
+    except Exception:
+        pass
+
+    # 4) Remove from in-memory cache
+    try:
+        if pdf_id in PDF_STORE:
+            del PDF_STORE[pdf_id]
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "pdf_id": pdf_id,
+        "courseTitle": course_title,
+        "deleted": {
+            "pdf_store": getattr(r_store, "deleted_count", 0) or 0,
+            "pdf_chat_sessions": getattr(r_sessions, "deleted_count", 0) or 0,
+            "pdf_chats": deleted_pdf_chats,
+        }
+    })
 
 
 if __name__ == "__main__":
