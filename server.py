@@ -3132,8 +3132,11 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
         page_no += 1
         try:
             print(f"[SEARCH] page={page_no} results_so_far={results_count} token={next_page_token}")
+            # Extra guard to reduce Shorts appearing in search results.
+            # (We still hard-filter by duration + title in _looks_like_shorts.)
+            safe_query = f"{query} -shorts -#shorts" if query else query
             search_response = youtube.search().list(
-                q=query,
+                q=safe_query,
                 part="snippet",
                 maxResults=min(50, max_results - results_count),
                 type="video",
@@ -3903,13 +3906,47 @@ def submit_quiz():
 
 
 # ---------------- CHAT (CONTINUOUS) ----------------
-CHAT_SESSIONS = {}   # conversation_id -> list of messages
+# NOTE:
+# - Persisted in MongoDB so it survives restarts.
+# - Still cached in-memory for speed.
+# - Stored per (uid, courseTitle, conversation_id).
+CHAT_SESSIONS = {}   # session_key (uid::courseTitle::conversation_id) -> list of messages
 MAX_TURNS = 20       # keep last N messages to control token usage
 
 # ---------------- PDF CHAT (Upload + Q&A) ----------------
-# In-memory storage (per server instance). For production, store in DB or object storage.
-PDF_STORE = {}  # pdf_id -> {uid, filename, text, chunks, created_at}
+# NOTE:
+# - PDF text/chunks are persisted in MongoDB (db.pdf_store).
+# - PDF chat history is persisted in MongoDB (db.pdf_chat_sessions).
+# - We still keep a small in-memory cache (PDF_STORE) per server instance.
+PDF_STORE = {}  # pdf_id -> {uid, courseTitle, filename, text, chunks, created_at}
 MAX_PDF_CHARS = 250_000  # safety cap for extracted text
+
+
+def _pdf_cache_put(obj: dict):
+    try:
+        pdf_id = obj.get("pdf_id") or obj.get("id")
+        if pdf_id:
+            PDF_STORE[pdf_id] = obj
+    except Exception:
+        pass
+
+
+def _pdf_get(uid: str, pdf_id: str):
+    """Fetch PDF from in-memory cache first, then MongoDB."""
+    if not pdf_id:
+        return None
+
+    obj = PDF_STORE.get(pdf_id)
+    if obj and obj.get("uid") == uid:
+        return obj
+
+    db = get_db()
+    if db is None:
+        return None
+    doc = db.pdf_store.find_one({"pdf_id": pdf_id, "uid": uid}, projection={"_id": 0})
+    if doc:
+        _pdf_cache_put(doc)
+    return doc
 
 
 def _chunk_text(s: str, chunk_size: int = 1200, overlap: int = 200):
@@ -3988,12 +4025,14 @@ def chat_bot():
     # Load history
     history = CHAT_SESSIONS.get(session_key)
     if history is None:
-        doc = db.chat_sessions.find_one(
-            {"uid": user["uid"], "courseTitle": course_title, "conversation_id": conversation_id},
-            sort=[("updatedAt", -1)],
-            projection={"_id": 0, "history": 1}
-        )
-        history = (doc.get("history") if doc else []) or []
+        history = []
+        if db is not None:
+            doc = db.chat_sessions.find_one(
+                {"uid": user["uid"], "courseTitle": course_title, "conversation_id": conversation_id},
+                sort=[("updatedAt", -1)],
+                projection={"_id": 0, "history": 1}
+            )
+            history = (doc.get("history") if doc else []) or []
 
     # Add user message
     history.append({"role": "user", "content": user_input})
@@ -4036,12 +4075,13 @@ Now respond to the latest user message only.
         history = _trim_history(history)
 
         CHAT_SESSIONS[session_key] = history
-        now = datetime.now(timezone.utc)
-        db.chat_sessions.update_one(
-            {"uid": user["uid"], "courseTitle": course_title, "conversation_id": conversation_id},
-            {"$set": {"history": history, "updatedAt": now}, "$setOnInsert": {"createdAt": now}},
-            upsert=True
-        )
+        if db is not None:
+            now = datetime.now(timezone.utc)
+            db.chat_sessions.update_one(
+                {"uid": user["uid"], "courseTitle": course_title, "conversation_id": conversation_id},
+                {"$set": {"history": history, "updatedAt": now}, "$setOnInsert": {"createdAt": now}},
+                upsert=True
+            )
 
         return jsonify({
             "conversation_id": conversation_id,
@@ -4054,6 +4094,103 @@ Now respond to the latest user message only.
             return jsonify({"error": "Gemini quota exceeded. Please try later or enable billing."}), 429
         return jsonify({"error": str(e)}), 500
 
+
+@app.route("/chat/history", methods=["GET"])
+def chat_history():
+    """Return stored chat history for a specific course + conversation."""
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    course_title = (request.args.get("courseTitle") or request.args.get("course") or "").strip()
+    conversation_id = (request.args.get("conversation_id") or "").strip()
+    if not course_title or not conversation_id:
+        return jsonify({"error": "courseTitle and conversation_id are required"}), 400
+
+    session_key = f"{user['uid']}::{course_title}::{conversation_id}"
+    history = CHAT_SESSIONS.get(session_key)
+
+    db = get_db()
+    if history is None and db is not None:
+        doc = db.chat_sessions.find_one(
+            {"uid": user["uid"], "courseTitle": course_title, "conversation_id": conversation_id},
+            projection={"_id": 0, "history": 1}
+        ) or {}
+        history = (doc.get("history") or [])
+        CHAT_SESSIONS[session_key] = history
+
+    return jsonify({
+        "courseTitle": course_title,
+        "conversation_id": conversation_id,
+        "history": history or []
+    })
+
+
+def _delete_pair_from_history(history: list, pair_index: int) -> list:
+    """Treat one Q+A as a pair (user then assistant). Delete by pair index (0-based)."""
+    if not isinstance(history, list):
+        return []
+    try:
+        pi = int(pair_index)
+    except Exception:
+        return history
+    if pi < 0:
+        return history
+
+    i = pi * 2
+    if i >= len(history):
+        return history
+
+    new_hist = list(history)
+    del new_hist[i : min(len(new_hist), i + 2)]
+    return new_hist
+
+
+@app.route("/chat/history/pair", methods=["DELETE"])
+def chat_history_delete_pair():
+    """Delete a Q+A pair (one set) for a course chat."""
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    data = request.get_json() or {}
+    course_title = (data.get("courseTitle") or data.get("course") or "").strip()
+    conversation_id = (data.get("conversation_id") or "").strip()
+    pair_index = data.get("pair_index")
+
+    if not course_title or not conversation_id or pair_index is None:
+        return jsonify({"error": "courseTitle, conversation_id, and pair_index are required"}), 400
+
+    session_key = f"{user['uid']}::{course_title}::{conversation_id}"
+    db = get_db()
+
+    history = CHAT_SESSIONS.get(session_key)
+    if history is None and db is not None:
+        doc = db.chat_sessions.find_one(
+            {"uid": user["uid"], "courseTitle": course_title, "conversation_id": conversation_id},
+            projection={"_id": 0, "history": 1},
+        ) or {}
+        history = (doc.get("history") or [])
+
+    history = _delete_pair_from_history(history or [], pair_index)
+    CHAT_SESSIONS[session_key] = history
+
+    if db is not None:
+        now = datetime.now(timezone.utc)
+        db.chat_sessions.update_one(
+            {"uid": user["uid"], "courseTitle": course_title, "conversation_id": conversation_id},
+            {"$set": {"history": history, "updatedAt": now}},
+            upsert=True,
+        )
+
+    return jsonify({
+        "courseTitle": course_title,
+        "conversation_id": conversation_id,
+        "history": history,
+    })
+
 @app.route("/pdf/upload", methods=["POST"])
 def pdf_upload():
     user, err = require_user()
@@ -4065,6 +4202,8 @@ def pdf_upload():
         return jsonify({"error": "No file provided (field name: file)"}), 400
 
     f = request.files["file"]
+    # Optional: store per-course
+    course_title = (request.form.get("courseTitle") or request.form.get("course") or "").strip() or "Course"
     filename = (getattr(f, 'filename', '') or '').strip() or 'document.pdf'
     if not filename.lower().endswith('.pdf'):
         return jsonify({"error": "Only PDF files are supported"}), 400
@@ -4089,15 +4228,28 @@ def pdf_upload():
 
         chunks = _chunk_text(text)
         pdf_id = str(uuid.uuid4())
-        PDF_STORE[pdf_id] = {
+        now = datetime.now(timezone.utc)
+        doc = {
+            "pdf_id": pdf_id,
             "uid": user["uid"],
+            "courseTitle": course_title,
             "filename": filename,
             "text": text,
             "chunks": chunks,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "createdAt": now,
+            "updatedAt": now,
         }
 
-        return jsonify({"pdf_id": pdf_id, "filename": filename, "chunks": len(chunks)})
+        # cache + persist
+        PDF_STORE[pdf_id] = {
+            **doc,
+            "created_at": now.isoformat(),
+        }
+        db = get_db()
+        if db is not None:
+            db.pdf_store.insert_one(doc)
+
+        return jsonify({"pdf_id": pdf_id, "filename": filename, "chunks": len(chunks), "courseTitle": course_title})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -4112,11 +4264,15 @@ def pdf_chat():
     data = request.get_json() or {}
     pdf_id = (data.get("pdf_id") or '').strip()
     question = (data.get("question") or '').strip()
+    conversation_id = (data.get("conversation_id") or '').strip()
+    course_title = (data.get("courseTitle") or data.get("course") or '').strip() or "Course"
 
     if not pdf_id or not question:
         return jsonify({"error": "pdf_id and question are required"}), 400
+    if not conversation_id:
+        return jsonify({"error": "conversation_id is required"}), 400
 
-    obj = PDF_STORE.get(pdf_id)
+    obj = _pdf_get(user["uid"], pdf_id)
     if not obj or obj.get("uid") != user["uid"]:
         return jsonify({"error": "PDF not found (upload again)"}), 404
 
@@ -4146,15 +4302,119 @@ User question:
 {question}
 """
 
+    # Persist per-pdf chat history
+    db = get_db()
+    session_key = f"{user['uid']}::{course_title}::{pdf_id}::{conversation_id}"
+    history = []
+    if db is not None:
+        doc = db.pdf_chat_sessions.find_one(
+            {"uid": user["uid"], "courseTitle": course_title, "pdf_id": pdf_id, "conversation_id": conversation_id},
+            projection={"_id": 0, "history": 1}
+        ) or {}
+        history = (doc.get("history") or [])
+    history.append({"role": "user", "content": question})
+    history = _trim_history(history)
+
     try:
         model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content(prompt)
         reply_text = (getattr(response, 'text', None) or '').strip()
-        return jsonify({"reply": reply_text})
+
+        history.append({"role": "assistant", "content": reply_text})
+        history = _trim_history(history)
+        if db is not None:
+            now = datetime.now(timezone.utc)
+            db.pdf_chat_sessions.update_one(
+                {"uid": user["uid"], "courseTitle": course_title, "pdf_id": pdf_id, "conversation_id": conversation_id},
+                {"$set": {"history": history, "updatedAt": now}, "$setOnInsert": {"createdAt": now}},
+                upsert=True
+            )
+
+        return jsonify({
+            "reply": reply_text,
+            "pdf_id": pdf_id,
+            "courseTitle": course_title,
+            "conversation_id": conversation_id,
+            "history_size": len(history)
+        })
     except Exception as e:
         if is_quota_error(e):
             return jsonify({"error": "Gemini quota exceeded. Please try later or enable billing."}), 429
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/pdf/chat/history", methods=["GET"])
+def pdf_chat_history():
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    pdf_id = (request.args.get("pdf_id") or '').strip()
+    conversation_id = (request.args.get("conversation_id") or '').strip()
+    course_title = (request.args.get("courseTitle") or request.args.get("course") or '').strip() or "Course"
+    if not pdf_id or not conversation_id:
+        return jsonify({"error": "pdf_id and conversation_id are required"}), 400
+
+    db = get_db()
+    history = []
+    if db is not None:
+        doc = db.pdf_chat_sessions.find_one(
+            {"uid": user["uid"], "courseTitle": course_title, "pdf_id": pdf_id, "conversation_id": conversation_id},
+            projection={"_id": 0, "history": 1}
+        ) or {}
+        history = (doc.get("history") or [])
+
+    return jsonify({
+        "pdf_id": pdf_id,
+        "courseTitle": course_title,
+        "conversation_id": conversation_id,
+        "history": history or []
+    })
+
+
+@app.route("/pdf/chat/history/pair", methods=["DELETE"])
+def pdf_chat_history_delete_pair():
+    """Delete a Q+A pair (one set) for a PDF chat."""
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    data = request.get_json() or {}
+    pdf_id = (data.get("pdf_id") or "").strip()
+    course_title = (data.get("courseTitle") or data.get("course") or "").strip() or "Course"
+    conversation_id = (data.get("conversation_id") or "").strip()
+    pair_index = data.get("pair_index")
+
+    if not pdf_id or not conversation_id or pair_index is None:
+        return jsonify({"error": "pdf_id, conversation_id, and pair_index are required"}), 400
+
+    db = get_db()
+    history = []
+    if db is not None:
+        doc = db.pdf_chat_sessions.find_one(
+            {"uid": user["uid"], "courseTitle": course_title, "pdf_id": pdf_id, "conversation_id": conversation_id},
+            projection={"_id": 0, "history": 1},
+        ) or {}
+        history = (doc.get("history") or [])
+
+    history = _delete_pair_from_history(history or [], pair_index)
+
+    if db is not None:
+        now = datetime.now(timezone.utc)
+        db.pdf_chat_sessions.update_one(
+            {"uid": user["uid"], "courseTitle": course_title, "pdf_id": pdf_id, "conversation_id": conversation_id},
+            {"$set": {"history": history, "updatedAt": now}},
+            upsert=True,
+        )
+
+    return jsonify({
+        "pdf_id": pdf_id,
+        "courseTitle": course_title,
+        "conversation_id": conversation_id,
+        "history": history,
+    })
 
 
 
