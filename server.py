@@ -4254,6 +4254,33 @@ def pdf_upload():
         return jsonify({"error": str(e)}), 500
 
 
+
+@app.route("/pdf/list", methods=["GET"])
+def pdf_list():
+    """List PDFs uploaded by the user for a specific course (used to restore multi-PDF history)."""
+    user, err = require_user()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    course_title = (request.args.get("courseTitle") or request.args.get("course") or "").strip() or "Course"
+
+    db = get_db()
+    pdfs = []
+    if db is not None:
+        cur = db.pdf_store.find(
+            {"uid": user["uid"], "courseTitle": course_title},
+            projection={"_id": 0, "pdf_id": 1, "filename": 1, "createdAt": 1},
+        ).sort("createdAt", -1)
+        for d in cur:
+            pid = d.get("pdf_id")
+            if not pid:
+                continue
+            pdfs.append({"id": pid, "name": d.get("filename") or "document.pdf"})
+
+    return jsonify({"courseTitle": course_title, "pdfs": pdfs})
+
+
 @app.route("/pdf/chat", methods=["POST"])
 def pdf_chat():
     user, err = require_user()
