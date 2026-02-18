@@ -333,7 +333,15 @@ def _send_email_sync_sendgrid(to_email: str, subject: str, html_body: str, text_
         return False
 
 
-def _send_email_sync_mailgun(to_email: str, subject: str, html_body: str, text_body: str = "") -> bool:
+def _send_email_sync_mailgun(
+    to_email: str,
+    subject: str,
+    html_body: str,
+    text_body: str = "",
+    *,
+    from_email: str = None,
+    reply_to: str = None,
+) -> bool:
     """Send email via Mailgun HTTP API. Returns True if Mailgun accepted the message."""
     api_key = os.getenv("MAILGUN_API_KEY", "").strip()
     domain = os.getenv("MAILGUN_DOMAIN", "").strip()
@@ -344,7 +352,7 @@ def _send_email_sync_mailgun(to_email: str, subject: str, html_body: str, text_b
     base_url = (os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net").strip().rstrip("/"))
     endpoint = f"{base_url}/v3/{domain}/messages"
 
-    from_email = (os.getenv("MAILGUN_FROM", "").strip() or os.getenv("MAIL_FROM", "").strip() or os.getenv("SMTP_FROM", "").strip() or SMTP_USER).strip()
+    from_email = (from_email or os.getenv("MAILGUN_FROM", "").strip() or os.getenv("MAIL_FROM", "").strip() or os.getenv("SMTP_FROM", "").strip() or SMTP_USER).strip()
     if not from_email:
         return False
 
@@ -355,6 +363,9 @@ def _send_email_sync_mailgun(to_email: str, subject: str, html_body: str, text_b
         "text": text_body or " ",
         "html": html_body,
     }
+    # Mailgun custom headers use the h: prefix
+    if reply_to:
+        data["h:Reply-To"] = reply_to
 
     try:
         import requests  # type: ignore
@@ -410,8 +421,40 @@ def _is_render_env() -> bool:
         or os.getenv("RENDER_INSTANCE_ID")
     )
 
+def _is_local_env() -> bool:
+    """Detect local/dev environment."""
+    env = (os.getenv("ENV") or os.getenv("FLASK_ENV") or os.getenv("APP_ENV") or "").strip().lower()
+    if env in ("local", "dev", "development"):
+        return True
+    # If explicitly running on localhost URLs
+    base = (os.getenv("FRONTEND_BASE_URL", "") or "").lower()
+    api = (os.getenv("API_BASE", "") or "").lower()
+    if "localhost" in base or "127.0.0.1" in base or "localhost" in api or "127.0.0.1" in api:
+        return True
+    return False
+
+def _is_hosted_env() -> bool:
+    """Detect common hosted environments (Render/Vercel/Railway/Fly/Heroku/etc.)."""
+    return bool(
+        _is_render_env()
+        or os.getenv("VERCEL")
+        or os.getenv("VERCEL_URL")
+        or os.getenv("RAILWAY_ENVIRONMENT")
+        or os.getenv("FLY_APP_NAME")
+        or os.getenv("HEROKU_APP_NAME")
+    )
+
 def _preferred_mail_provider() -> str:
-    """Always use SMTP (Google Workspace)."""
+    """Use Mailgun when hosted; use SMTP while developing locally."""
+    # Force override if you want
+    forced = (os.getenv("MAIL_PROVIDER") or os.getenv("EMAIL_PROVIDER") or "").strip().lower()
+    if forced in ("smtp", "mailgun", "sendgrid"):
+        return forced
+
+    if _is_hosted_env() and os.getenv("MAILGUN_API_KEY", "").strip() and os.getenv("MAILGUN_DOMAIN", "").strip():
+        return "mailgun"
+
+    # Default: local/dev uses SMTP
     return "smtp"
 
 def _send_email(
@@ -423,20 +466,48 @@ def _send_email(
     kind: str = "",
     reply_to: str = None,
 ):
-    """Send email on a background thread (SMTP only)."""
+    """Send email on a background thread.
+
+    Behavior:
+    - Local/dev: SMTP (Titan/Workspace/etc.)
+    - Hosted: Mailgun (if configured), with fallbacks to SendGrid/SMTP if desired
+    """
     if not to_email:
         return
 
     from_email = _pick_from(kind)
 
     def _job():
-        # Optional fallback: SendGrid if configured (useful if SMTP is blocked by host)
-        if os.getenv("SENDGRID_API_KEY", "").strip():
-            if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
-                return
-        _send_email_sync_smtp(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to)
+    provider = _preferred_mail_provider()
 
-    try:
+    # Hosted -> Mailgun (recommended)
+    if provider == "mailgun":
+        if _send_email_sync_mailgun(
+            to_email,
+            subject,
+            html_body,
+            text_body,
+            from_email=from_email,
+            reply_to=reply_to,
+        ):
+            return
+
+    # Optional fallback: SendGrid if configured (useful if SMTP is blocked by host)
+    if provider == "sendgrid" or os.getenv("SENDGRID_API_KEY", "").strip():
+        if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
+            return
+
+    # Default/local: SMTP
+    _send_email_sync_smtp(
+        to_email,
+        subject,
+        html_body,
+        text_body,
+        from_email=from_email,
+        reply_to=reply_to,
+    )
+
+try:
         import threading
         t = threading.Thread(target=_job, daemon=True)
         t.start()
