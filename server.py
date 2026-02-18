@@ -342,75 +342,50 @@ def _send_email_sync_mailgun(
     from_email: str = None,
     reply_to: str = None,
 ) -> bool:
-    """Send email via Mailgun HTTP API. Returns True if Mailgun accepted the message."""
+    """Send email via Mailgun HTTP API. Returns True if accepted."""
     api_key = os.getenv("MAILGUN_API_KEY", "").strip()
     domain = os.getenv("MAILGUN_DOMAIN", "").strip()
-    if not api_key or not domain:
+    if not api_key or not domain or not to_email:
         return False
 
-    # API base: US (default) or EU (set MAILGUN_BASE_URL=https://api.eu.mailgun.net)
-    base_url = (os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net").strip().rstrip("/"))
+    base_url = _normalize_mailgun_base_url(os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net"))
     endpoint = f"{base_url}/v3/{domain}/messages"
 
-    from_email = (from_email or os.getenv("MAILGUN_FROM", "").strip() or os.getenv("MAIL_FROM", "").strip() or os.getenv("SMTP_FROM", "").strip() or SMTP_USER).strip()
-    if not from_email:
+    # Use verified From by default (good for DMARC), optionally allow spoofing if you explicitly enable it.
+    allow_spoof = os.getenv("MAILGUN_ALLOW_SPOOF_FROM", "false").strip().lower() in {"1", "true", "yes"}
+    verified_from = (
+        os.getenv("MAILGUN_FROM", "").strip()
+        or os.getenv("MAIL_FROM", "").strip()
+        or os.getenv("MAIL_FROM_DEFAULT", "").strip()
+        or os.getenv("SMTP_FROM", "").strip()
+        or os.getenv("SMTP_USER", "").strip()
+    ).strip()
+
+    chosen_from = (from_email or verified_from).strip()
+    if not chosen_from:
         return False
+    if not allow_spoof and verified_from:
+        chosen_from = verified_from
 
     data = {
-        "from": f"Zenith Learning <{from_email}>",
+        "from": chosen_from,
         "to": [to_email],
         "subject": subject,
-        "text": text_body or " ",
-        "html": html_body,
+        "text": text_body or "",
+        "html": html_body or "",
     }
-    # Mailgun custom headers use the h: prefix
     if reply_to:
         data["h:Reply-To"] = reply_to
 
     try:
-        import requests  # type: ignore
-    except Exception:
-        requests = None
-
-    try:
-        if requests:
-            r = requests.post(
-                endpoint,
-                auth=("api", api_key),
-                data=data,
-                timeout=10,
-            )
-            if 200 <= r.status_code < 300:
-                print("[MAIL] Mailgun accepted:", subject, "->", to_email)
-                return True
-            print("[MAIL] Mailgun failed:", r.status_code, getattr(r, "text", ""))
-            return False
-        else:
-            # Minimal fallback without requests
-            import urllib.request
-            import urllib.parse
-            import base64
-
-            encoded = urllib.parse.urlencode({k: (v[0] if isinstance(v, list) else v) for k, v in data.items()}).encode("utf-8")
-            auth_header = base64.b64encode(f"api:{api_key}".encode("utf-8")).decode("ascii")
-            req = urllib.request.Request(
-                endpoint,
-                data=encoded,
-                headers={"Authorization": f"Basic {auth_header}", "Content-Type": "application/x-www-form-urlencoded"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                code = getattr(resp, "status", 200)
-                if 200 <= code < 300:
-                    print("[MAIL] Mailgun accepted:", subject, "->", to_email)
-                    return True
-                print("[MAIL] Mailgun failed:", code)
-                return False
+        resp = requests.post(endpoint, auth=HTTPBasicAuth("api", api_key), data=data, timeout=20)
+        ok = 200 <= resp.status_code < 300
+        if not ok:
+            print("[MAIL] Mailgun failed:", resp.status_code, resp.text[:300])
+        return ok
     except Exception as e:
-        print("[MAIL] Mailgun send failed:", e)
+        print("[MAIL] Mailgun exception:", repr(e))
         return False
-
-
 
 def _is_render_env() -> bool:
     """Detect Render hosted environment."""
@@ -421,41 +396,49 @@ def _is_render_env() -> bool:
         or os.getenv("RENDER_INSTANCE_ID")
     )
 
-def _is_local_env() -> bool:
-    """Detect local/dev environment."""
-    env = (os.getenv("ENV") or os.getenv("FLASK_ENV") or os.getenv("APP_ENV") or "").strip().lower()
-    if env in ("local", "dev", "development"):
-        return True
-    # If explicitly running on localhost URLs
-    base = (os.getenv("FRONTEND_BASE_URL", "") or "").lower()
-    api = (os.getenv("API_BASE", "") or "").lower()
-    if "localhost" in base or "127.0.0.1" in base or "localhost" in api or "127.0.0.1" in api:
-        return True
-    return False
-
-def _is_hosted_env() -> bool:
-    """Detect common hosted environments (Render/Vercel/Railway/Fly/Heroku/etc.)."""
+def _is_hosted() -> bool:
+    # Render sets at least one of these in most deployments
     return bool(
-        _is_render_env()
-        or os.getenv("VERCEL")
-        or os.getenv("VERCEL_URL")
-        or os.getenv("RAILWAY_ENVIRONMENT")
-        or os.getenv("FLY_APP_NAME")
-        or os.getenv("HEROKU_APP_NAME")
+        os.getenv("RENDER")
+        or os.getenv("RENDER_SERVICE_ID")
+        or os.getenv("RENDER_EXTERNAL_URL")
+        or os.getenv("RENDER_INSTANCE_ID")
+        or os.getenv("PORT")  # common on hosts
     )
 
+def _mailgun_ready() -> bool:
+    return bool(os.getenv("MAILGUN_API_KEY", "").strip() and os.getenv("MAILGUN_DOMAIN", "").strip())
+
+def _normalize_mailgun_base_url(raw: str) -> str:
+    """Normalize MAILGUN_BASE_URL.
+
+    Your env may contain something like: "https://api.mailgun.net/v3\n"
+    We normalize it to: https://api.mailgun.net
+    """
+    if not raw:
+        return "https://api.mailgun.net"
+    base = raw.strip().strip('"').strip("'").replace("\\n", "").strip()
+    base = base.rstrip("/")
+    if base.endswith("/v3"):
+        base = base[:-3].rstrip("/")
+    return base or "https://api.mailgun.net"
+
+
 def _preferred_mail_provider() -> str:
-    """Use Mailgun when hosted; use SMTP while developing locally."""
-    # Force override if you want
-    forced = (os.getenv("MAIL_PROVIDER") or os.getenv("EMAIL_PROVIDER") or "").strip().lower()
-    if forced in ("smtp", "mailgun", "sendgrid"):
-        return forced
+    """Choose mail provider.
 
-    if _is_hosted_env() and os.getenv("MAILGUN_API_KEY", "").strip() and os.getenv("MAILGUN_DOMAIN", "").strip():
-        return "mailgun"
+    Rules:
+    - Hosted (Render/production): prefer Mailgun if configured, else fallback to SMTP
+    - Localhost/dev: prefer SMTP, else fallback to Mailgun
+    Optional override: MAIL_PROVIDER=smtp|mailgun|sendgrid
+    """
+    override = os.getenv("MAIL_PROVIDER", "").strip().lower()
+    if override in {"smtp", "mailgun", "sendgrid"}:
+        return override
 
-    # Default: local/dev uses SMTP
-    return "smtp"
+    if _is_hosted():
+        return "mailgun" if _mailgun_ready() else "smtp"
+    return "smtp" if _smtp_ready() else "mailgun"
 
 def _send_email(
     to_email: str,
@@ -466,54 +449,75 @@ def _send_email(
     kind: str = "",
     reply_to: str = None,
 ):
-    """Send email on a background thread.
+    """Unified email sender (Mailgun + SMTP).
 
-    Behavior:
-    - Local/dev: SMTP (Titan/Workspace/etc.)
-    - Hosted: Mailgun (if configured), with fallbacks to SendGrid/SMTP if desired
+    - Hosted (Render): Mailgun first, then SMTP fallback
+    - Localhost: SMTP first, then Mailgun fallback
     """
     if not to_email:
         return
 
     from_email = _pick_from(kind)
-
-    def _job():
     provider = _preferred_mail_provider()
 
-    # Hosted -> Mailgun (recommended)
-    if provider == "mailgun":
-        if _send_email_sync_mailgun(
-            to_email,
-            subject,
-            html_body,
-            text_body,
-            from_email=from_email,
-            reply_to=reply_to,
-        ):
+    def _job():
+        # If explicitly forced to SendGrid, try it first (if configured)
+        if provider == "sendgrid":
+            if os.getenv("SENDGRID_API_KEY", "").strip():
+                try:
+                    if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
+                        return
+                except Exception as e:
+                    print("[MAIL] SendGrid exception:", repr(e))
+            # fall through to host/local strategy
+
+        if provider == "mailgun":
+            if _send_email_sync_mailgun(
+                to_email, subject, html_body, text_body,
+                from_email=from_email, reply_to=reply_to
+            ):
+                return
+            _send_email_sync_smtp(
+                to_email, subject, html_body, text_body,
+                from_email=from_email, reply_to=reply_to
+            )
             return
 
-    # Optional fallback: SendGrid if configured (useful if SMTP is blocked by host)
-    if provider == "sendgrid" or os.getenv("SENDGRID_API_KEY", "").strip():
-        if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
+        if provider == "smtp":
+            if _send_email_sync_smtp(
+                to_email, subject, html_body, text_body,
+                from_email=from_email, reply_to=reply_to
+            ):
+                return
+            _send_email_sync_mailgun(
+                to_email, subject, html_body, text_body,
+                from_email=from_email, reply_to=reply_to
+            )
             return
 
-    # Default/local: SMTP
-    _send_email_sync_smtp(
-        to_email,
-        subject,
-        html_body,
-        text_body,
-        from_email=from_email,
-        reply_to=reply_to,
-    )
+        # safe default
+        if _is_hosted():
+            if _send_email_sync_mailgun(
+                to_email, subject, html_body, text_body,
+                from_email=from_email, reply_to=reply_to
+            ):
+                return
+            _send_email_sync_smtp(
+                to_email, subject, html_body, text_body,
+                from_email=from_email, reply_to=reply_to
+            )
+        else:
+            if _send_email_sync_smtp(
+                to_email, subject, html_body, text_body,
+                from_email=from_email, reply_to=reply_to
+            ):
+                return
+            _send_email_sync_mailgun(
+                to_email, subject, html_body, text_body,
+                from_email=from_email, reply_to=reply_to
+            )
 
-try:
-        import threading
-        t = threading.Thread(target=_job, daemon=True)
-        t.start()
-    except Exception as e:
-        print("[MAIL] Could not spawn mail thread:", e)
-        _job()
+    threading.Thread(target=_job, daemon=True).start()
 
 def _brand_email(title: str, preheader: str = "", body_html: str = "", primary_cta: dict = None, secondary_cta: dict = None):
     """Return a professional, branded email HTML."""
