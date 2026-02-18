@@ -2,84 +2,52 @@
   {
     "Week 1": [
       {
-        "topic": "Advanced Array Problems Sliding Window Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=tk38CTSAYsg"
+        "topic": "Rust Programming Language advanced ownership borrowing lifetimes deep dive",
+        "video": "https://www.youtube.com/watch?v=h2J6zoS56UQ"
       },
       {
-        "topic": "Two Pointers Technique Interview Questions Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=Z_c4byLrNBU"
+        "topic": "Rust Programming Language smart pointers Box Rc Arc Mutex Cell RefCell",
+        "video": "No video found"
       },
       {
-        "topic": "Advanced Linked List Problems Recursion Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=58YbpRDc4yw"
+        "topic": "Rust Programming Language async await concurrency patterns",
+        "video": "https://www.youtube.com/watch?v=qP7LzZqGh30"
       },
       {
-        "topic": "Tree Traversal Algorithms Practice Problems Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=WLvU5EQVZqY"
+        "topic": "Rust Programming Language Tokio framework advanced usage",
+        "video": "https://www.youtube.com/watch?v=0y6RKiIk6cs"
       },
       {
-        "topic": "Binary Search Tree Advanced Concepts For Placements",
-        "video": "https://www.youtube.com/watch?v=cySVml6e_Fc"
+        "topic": "Rust Programming Language performance optimization techniques low level",
+        "video": "https://www.youtube.com/watch?v=4gwYkEK0gOk"
       },
       {
-        "topic": "Heap Data Structure Priority Queue Interview Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=Qf-TDPr0nYw"
+        "topic": "Rust Programming Language unsafe code considerations FFI interop",
+        "video": "No video found"
       },
       {
-        "topic": "Trie Data Structure Implementation For Placements",
-        "video": "https://www.youtube.com/watch?v=ZjMo21L_XoE"
+        "topic": "Rust Programming Language advanced trait object dynamic dispatch scenarios",
+        "video": "No video found"
       },
       {
-        "topic": "Segment Tree Fenwick Tree Tutorial Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=EMDMy9TkQGM"
+        "topic": "Rust Programming Language custom error handling patterns best practices",
+        "video": "https://www.youtube.com/watch?v=-mN3VyJuCjM"
       },
       {
-        "topic": "Graph Algorithms BFS DFS Advanced Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=dis_c84ejhQ"
+        "topic": "Rust Programming Language procedural macros for code generation",
+        "video": "https://www.youtube.com/watch?v=59mWuOXs3dU"
       },
       {
-        "topic": "Dijkstra Floyd Warshall Bellman Ford Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=KudAWAMiQog"
+        "topic": "Rust Programming Language advanced testing strategies benchmarks fuzzer",
+        "video": "https://www.youtube.com/watch?v=gnchfOojMk4"
       },
       {
-        "topic": "Minimum Spanning Tree Algorithms For Placements",
-        "video": "https://www.youtube.com/watch?v=ZSPjZuZWCME"
+        "topic": "Rust Programming Language data structures algorithms for interviews",
+        "video": "https://www.youtube.com/watch?v=8hly31xKli0"
       },
       {
-        "topic": "Dynamic Programming Patterns For Placements",
-        "video": "https://www.youtube.com/watch?v=sWnBVPRA0yQ"
-      },
-      {
-        "topic": "Advanced DP Interview Questions Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=wjFgd8JJ8NM"
-      },
-      {
-        "topic": "Backtracking Permutations Combinations Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=DKCbsiDBN6c"
-      },
-      {
-        "topic": "Greedy Algorithms Problem Solving Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=3H2G3KuEiRU"
-      },
-      {
-        "topic": "Bit Manipulation Tricks For Placements",
-        "video": "https://www.youtube.com/watch?v=G4st5-0LYso"
-      },
-      {
-        "topic": "Disjoint Set Union Advanced Problems Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=xS9EiDkrn1A"
-      },
-      {
-        "topic": "Topological Sort Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=7J3GadLzydI"
-      },
-      {
-        "topic": "LRU Cache Design Interview Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=OhCp6ppX6bg"
-      },
-      {
-        "topic": "System Design Using Data Structures For Placements",
-        "video": "https://www.youtube.com/watch?v=m8Icp_Cid5o"
+        "topic": "Rust Programming Language common interview questions solutions explained",
+        "video": "https://www.youtube.com/watch?v=lL_j7ilk7rc"
       }
     ]
   }

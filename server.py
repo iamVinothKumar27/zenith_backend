@@ -191,8 +191,32 @@ CONTACT_INBOX = os.getenv("CONTACT_INBOX", "contact@zenithlearning.site").strip(
 
 
 def _smtp_ready() -> bool:
-    return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS)
+    """Return True if SMTP config is usable (reads from env at call time)."""
+    host = (os.getenv("SMTP_HOST", "") or "").strip()
+    port_raw = (os.getenv("SMTP_PORT", "") or "").strip()
+    user = (os.getenv("SMTP_USER", "") or "").strip()
+    pw = (os.getenv("SMTP_PASS", "") or "").strip()
 
+    try:
+        port = int(port_raw) if port_raw else 587
+    except Exception:
+        port = 587
+
+    if host and port and user and pw:
+        return True
+
+    # Local/no-auth mode
+    no_auth = (os.getenv("SMTP_NO_AUTH", "").strip().lower() in ("1", "true", "yes", "y"))
+    local_host = host.lower() in ("localhost", "127.0.0.1")
+    local_smtp_host = (os.getenv("LOCAL_SMTP_HOST", "").strip() or "").lower() in ("localhost", "127.0.0.1")
+    if host and port and (no_auth or local_host or local_smtp_host):
+        return True
+
+    # If LOCAL_SMTP_HOST/PORT are provided, treat that as SMTP ready (no auth)
+    if os.getenv("LOCAL_SMTP_HOST", "").strip() and os.getenv("LOCAL_SMTP_PORT", "").strip():
+        return True
+
+    return False
 def _pick_from(kind: str = "") -> str:
     k = (kind or "").strip().lower()
     if k in ("auth", "authentication", "login"):
@@ -219,17 +243,22 @@ def _send_email_sync_smtp(
     """Send email via SMTP. Returns True if sent, False otherwise.
 
     Notes:
-    - When using Google Workspace SMTP, authenticate with SMTP_USER (primary mailbox),
+    - When using Google Workspace SMTP, authenticate with user (primary mailbox),
       and set From to one of its verified aliases (courses@, profile@, etc.).
     - For contact form, prefer setting Reply-To to the user's email.
     """
     if not to_email:
         return False
+    host = (os.getenv("host", "") or "").strip()
+    port = (os.getenv("port", "") or "").strip()
+    user = (os.getenv("user", "") or "").strip()
+    pw = (os.getenv("pw", "") or "").strip()
+
     if not _smtp_ready():
         print("[MAIL] SMTP not configured. Skipping send to:", to_email, "subject:", subject)
         return False
 
-    sender = (from_email or MAIL_FROM_DEFAULT or SMTP_USER).strip()
+    sender = (from_email or MAIL_FROM_DEFAULT or user).strip()
 
     msg = MIMEMultipart("alternative")
     msg["From"] = f"Zenith Learning <{sender}>"
@@ -247,11 +276,11 @@ def _send_email_sync_smtp(
 
     server = None
     try:
-        if int(SMTP_PORT) == 465:
-            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=connect_timeout)
+        if int(port) == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=connect_timeout)
             server.ehlo()
         else:
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=connect_timeout)
+            server = smtplib.SMTP(host, port, timeout=connect_timeout)
             server.ehlo()
             try:
                 server.starttls()
@@ -259,7 +288,7 @@ def _send_email_sync_smtp(
             except Exception:
                 pass
 
-        server.login(SMTP_USER, SMTP_PASS)
+        server.login(user, pw)
         server.sendmail(sender, [to_email], msg.as_string())
         server.quit()
         print("[MAIL] SMTP Sent:", subject, "->", to_email, "| from:", sender)
@@ -333,59 +362,78 @@ def _send_email_sync_sendgrid(to_email: str, subject: str, html_body: str, text_
         return False
 
 
-def _send_email_sync_mailgun(
-    to_email: str,
-    subject: str,
-    html_body: str,
-    text_body: str = "",
-    *,
-    from_email: str = None,
-    reply_to: str = None,
-) -> bool:
-    """Send email via Mailgun HTTP API. Returns True if accepted."""
+def _send_email_sync_mailgun(to_email: str, subject: str, html_body: str, text_body: str = "") -> bool:
+    """Send email via Mailgun HTTP API. Returns True if Mailgun accepted the message."""
     api_key = os.getenv("MAILGUN_API_KEY", "").strip()
     domain = os.getenv("MAILGUN_DOMAIN", "").strip()
-    if not api_key or not domain or not to_email:
+    if not api_key or not domain:
         return False
 
-    base_url = _normalize_mailgun_base_url(os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net"))
+    # API base: US (default) or EU (set MAILGUN_BASE_URL=https://api.eu.mailgun.net)
+    base_url_raw = os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net")
+    base_url = (base_url_raw or "").strip().strip('"').strip("'").replace("\\n", "").replace("\n", "").strip().rstrip("/")
+    # If user mistakenly includes '/v3' in MAILGUN_BASE_URL, remove it to avoid '/v3/v3/...'
+    if base_url.endswith('/v3'):
+        base_url = base_url[:-3].rstrip('/')
+
     endpoint = f"{base_url}/v3/{domain}/messages"
 
-    # Use verified From by default (good for DMARC), optionally allow spoofing if you explicitly enable it.
-    allow_spoof = os.getenv("MAILGUN_ALLOW_SPOOF_FROM", "false").strip().lower() in {"1", "true", "yes"}
-    verified_from = (
-        os.getenv("MAILGUN_FROM", "").strip()
-        or os.getenv("MAIL_FROM", "").strip()
-        or os.getenv("MAIL_FROM_DEFAULT", "").strip()
-        or os.getenv("SMTP_FROM", "").strip()
-        or os.getenv("SMTP_USER", "").strip()
-    ).strip()
-
-    chosen_from = (from_email or verified_from).strip()
-    if not chosen_from:
+    from_email = (os.getenv("MAILGUN_FROM", "").strip() or os.getenv("MAIL_FROM", "").strip() or os.getenv("SMTP_FROM", "").strip() or SMTP_USER).strip()
+    if not from_email:
         return False
-    if not allow_spoof and verified_from:
-        chosen_from = verified_from
 
     data = {
-        "from": chosen_from,
+        "from": f"Zenith Learning <{from_email}>",
         "to": [to_email],
         "subject": subject,
-        "text": text_body or "",
-        "html": html_body or "",
+        "text": text_body or " ",
+        "html": html_body,
     }
-    if reply_to:
-        data["h:Reply-To"] = reply_to
 
     try:
-        resp = requests.post(endpoint, auth=HTTPBasicAuth("api", api_key), data=data, timeout=20)
-        ok = 200 <= resp.status_code < 300
-        if not ok:
-            print("[MAIL] Mailgun failed:", resp.status_code, resp.text[:300])
-        return ok
+        import requests  # type: ignore
+    except Exception:
+        requests = None
+
+    try:
+        if requests:
+            r = requests.post(
+                endpoint,
+                auth=("api", api_key),
+                data=data,
+                timeout=10,
+            )
+            if 200 <= r.status_code < 300:
+                print("[MAIL] Mailgun accepted:", subject, "->", to_email)
+                return True
+            print("[MAIL] Mailgun failed:", r.status_code, getattr(r, "text", ""))
+            return False
+        else:
+            # Minimal fallback without requests
+            import urllib.request
+            import urllib.parse
+            import base64
+
+            encoded = urllib.parse.urlencode({k: (v[0] if isinstance(v, list) else v) for k, v in data.items()}).encode("utf-8")
+            auth_header = base64.b64encode(f"api:{api_key}".encode("utf-8")).decode("ascii")
+            req = urllib.request.Request(
+                endpoint,
+                data=encoded,
+                headers={"Authorization": f"Basic {auth_header}", "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                code = getattr(resp, "status", 200)
+                if 200 <= code < 300:
+                    print("[MAIL] Mailgun accepted:", subject, "->", to_email)
+                    return True
+                print("[MAIL] Mailgun failed:", code)
+                return False
     except Exception as e:
-        print("[MAIL] Mailgun exception:", repr(e))
+        print("[MAIL] Mailgun send failed:", e)
         return False
+
+
 
 def _is_render_env() -> bool:
     """Detect Render hosted environment."""
@@ -396,49 +444,20 @@ def _is_render_env() -> bool:
         or os.getenv("RENDER_INSTANCE_ID")
     )
 
-def _is_hosted() -> bool:
-    # Render sets at least one of these in most deployments
-    return bool(
-        os.getenv("RENDER")
-        or os.getenv("RENDER_SERVICE_ID")
-        or os.getenv("RENDER_EXTERNAL_URL")
-        or os.getenv("RENDER_INSTANCE_ID")
-        or os.getenv("PORT")  # common on hosts
-    )
-
-def _mailgun_ready() -> bool:
-    return bool(os.getenv("MAILGUN_API_KEY", "").strip() and os.getenv("MAILGUN_DOMAIN", "").strip())
-
-def _normalize_mailgun_base_url(raw: str) -> str:
-    """Normalize MAILGUN_BASE_URL.
-
-    Your env may contain something like: "https://api.mailgun.net/v3\n"
-    We normalize it to: https://api.mailgun.net
-    """
-    if not raw:
-        return "https://api.mailgun.net"
-    base = raw.strip().strip('"').strip("'").replace("\\n", "").strip()
-    base = base.rstrip("/")
-    if base.endswith("/v3"):
-        base = base[:-3].rstrip("/")
-    return base or "https://api.mailgun.net"
-
-
 def _preferred_mail_provider() -> str:
-    """Choose mail provider.
+    """Choose mail provider based on environment.
 
-    Rules:
-    - Hosted (Render/production): prefer Mailgun if configured, else fallback to SMTP
-    - Localhost/dev: prefer SMTP, else fallback to Mailgun
-    Optional override: MAIL_PROVIDER=smtp|mailgun|sendgrid
+    Rule (as requested):
+    - Localhost/dev  => SMTP
+    - Render/Hosted  => Mailgun (HTTP API)
+
+    You can override with MAIL_PROVIDER=mailgun|smtp (useful for testing).
     """
-    override = os.getenv("MAIL_PROVIDER", "").strip().lower()
-    if override in {"smtp", "mailgun", "sendgrid"}:
-        return override
+    forced = (os.getenv("MAIL_PROVIDER", "") or "").strip().lower()
+    if forced in ("mailgun", "smtp"):
+        return forced
 
-    if _is_hosted():
-        return "mailgun" if _mailgun_ready() else "smtp"
-    return "smtp" if _smtp_ready() else "mailgun"
+    return "mailgun" if _is_render_env() else "smtp"
 
 def _send_email(
     to_email: str,
@@ -449,75 +468,62 @@ def _send_email(
     kind: str = "",
     reply_to: str = None,
 ):
-    """Unified email sender (Mailgun + SMTP).
-
-    - Hosted (Render): Mailgun first, then SMTP fallback
-    - Localhost: SMTP first, then Mailgun fallback
-    """
+    """Send email on a background thread (SMTP only)."""
     if not to_email:
         return
 
     from_email = _pick_from(kind)
-    provider = _preferred_mail_provider()
 
     def _job():
-        # If explicitly forced to SendGrid, try it first (if configured)
-        if provider == "sendgrid":
-            if os.getenv("SENDGRID_API_KEY", "").strip():
-                try:
-                    if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
-                        return
-                except Exception as e:
-                    print("[MAIL] SendGrid exception:", repr(e))
-            # fall through to host/local strategy
-
+        provider = _preferred_mail_provider()
+        # Render/Hosted: use Mailgun; Localhost: skip Mailgun
         if provider == "mailgun":
-            if _send_email_sync_mailgun(
-                to_email, subject, html_body, text_body,
-                from_email=from_email, reply_to=reply_to
-            ):
+            if _send_email_sync_mailgun(to_email, subject, html_body, text_body):
                 return
-            _send_email_sync_smtp(
-                to_email, subject, html_body, text_body,
-                from_email=from_email, reply_to=reply_to
-            )
-            return
 
-        if provider == "smtp":
-            if _send_email_sync_smtp(
-                to_email, subject, html_body, text_body,
-                from_email=from_email, reply_to=reply_to
-            ):
+        # Optional: SendGrid as secondary (useful if Mailgun is temporarily failing)
+        if provider in ("sendgrid", "auto") and os.getenv("SENDGRID_API_KEY", "").strip():
+            if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
                 return
-            _send_email_sync_mailgun(
-                to_email, subject, html_body, text_body,
-                from_email=from_email, reply_to=reply_to
-            )
-            return
 
-        # safe default
-        if _is_hosted():
-            if _send_email_sync_mailgun(
-                to_email, subject, html_body, text_body,
-                from_email=from_email, reply_to=reply_to
-            ):
+        # Localhost/dev (and final fallback everywhere): SMTP
+        # If LOCAL_SMTP_HOST/PORT are set, use them (no auth).
+        local_host = os.getenv("LOCAL_SMTP_HOST", "").strip()
+        local_port = os.getenv("LOCAL_SMTP_PORT", "").strip()
+        if local_host and local_port:
+            # Temporarily override SMTP settings for this send
+            old_host, old_port = os.getenv("SMTP_HOST"), os.getenv("SMTP_PORT")
+            old_user, old_pass = os.getenv("SMTP_USER"), os.getenv("SMTP_PASS")
+            os.environ["SMTP_HOST"] = local_host
+            os.environ["SMTP_PORT"] = local_port
+            # Ensure no-auth path is allowed
+            os.environ["SMTP_NO_AUTH"] = os.getenv("SMTP_NO_AUTH", "true")
+            os.environ["SMTP_USER"] = os.getenv("SMTP_USER", "")
+            os.environ["SMTP_PASS"] = os.getenv("SMTP_PASS", "")
+            try:
+                _send_email_sync_smtp(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to)
                 return
-            _send_email_sync_smtp(
-                to_email, subject, html_body, text_body,
-                from_email=from_email, reply_to=reply_to
-            )
+            finally:
+                # restore env
+                if old_host is None: os.environ.pop("SMTP_HOST", None)
+                else: os.environ["SMTP_HOST"] = old_host
+                if old_port is None: os.environ.pop("SMTP_PORT", None)
+                else: os.environ["SMTP_PORT"] = old_port
+                if old_user is None: os.environ.pop("SMTP_USER", None)
+                else: os.environ["SMTP_USER"] = old_user
+                if old_pass is None: os.environ.pop("SMTP_PASS", None)
+                else: os.environ["SMTP_PASS"] = old_pass
         else:
-            if _send_email_sync_smtp(
-                to_email, subject, html_body, text_body,
-                from_email=from_email, reply_to=reply_to
-            ):
-                return
-            _send_email_sync_mailgun(
-                to_email, subject, html_body, text_body,
-                from_email=from_email, reply_to=reply_to
-            )
+            _send_email_sync_smtp(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to)
 
-    threading.Thread(target=_job, daemon=True).start()
+
+    try:
+        import threading
+        t = threading.Thread(target=_job, daemon=True)
+        t.start()
+    except Exception as e:
+        print("[MAIL] Could not spawn mail thread:", e)
+        _job()
 
 def _brand_email(title: str, preheader: str = "", body_html: str = "", primary_cta: dict = None, secondary_cta: dict = None):
     """Return a professional, branded email HTML."""
