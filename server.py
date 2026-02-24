@@ -5339,47 +5339,46 @@ def _docx_replace_section(doc: Document, heading_patterns, new_paras, bullet: bo
 
 
 def _pdf_bytes_to_docx_document(pdf_bytes: bytes):
-    """Extract text from a *text-based* PDF and return a python-docx Document.
-
-    Why this exists:
-    - `pdf2docx` pulls in PyMuPDF (`fitz`) and can spike memory on small instances
-      (Render free/low-RAM plans), causing worker SIGKILL/OOM.
-    - For ATS we only need readable text, not layout-perfect conversion.
-
-    Returns:
-      - Document(...) when text extraction succeeds
-      - None when PDF is empty / scanned / text extraction fails
+    """Best-effort PDF -> DOCX conversion using pdf2docx.
+    Returns a python-docx Document if conversion succeeds, else None.
+    NOTE: Only text-based PDFs convert well; scanned PDFs may lose layout.
     """
     if not pdf_bytes:
         return None
     try:
-        from PyPDF2 import PdfReader  # type: ignore
+        from pdf2docx import Converter  # type: ignore
     except Exception:
         return None
 
+    pdf_path = None
+    docx_path = None
     try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages_text = []
-        for p in getattr(reader, "pages", []) or []:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fpdf:
+            fpdf.write(pdf_bytes)
+            pdf_path = fpdf.name
+        docx_path = pdf_path + ".docx"
+
+        cv = Converter(pdf_path)
+        try:
+            cv.convert(docx_path, start=0, end=None)
+        finally:
             try:
-                t = p.extract_text() or ""
+                cv.close()
             except Exception:
-                t = ""
-            if t:
-                pages_text.append(t)
+                pass
 
-        text = "\n".join(pages_text).strip()
-        if not text:
-            return None
-
-        doc = Document()
-        for line in text.splitlines():
-            ln = (line or "").strip()
-            if ln:
-                doc.add_paragraph(ln)
-        return doc
+        with open(docx_path, "rb") as fdocx:
+            docx_bytes = fdocx.read()
+        return Document(io.BytesIO(docx_bytes))
     except Exception:
         return None
+    finally:
+        for p in (docx_path, pdf_path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
 
 def _build_gemini_tailor_prompt(jd_struct: dict, resume_struct: dict, ats_struct: dict, jd_text: str, resume_text: str) -> str:
@@ -6778,22 +6777,47 @@ def ats_analyze():
 
     uid = user.get("uid")
 
-    resume_file = request.files.get("resume_file")
-    if not resume_file:
-        return jsonify({"error": "resume_file is required"}), 400
-    resume_text, resume_kind, resume_raw = _extract_resume_text(resume_file)
-    if not resume_text:
-        return jsonify({"error": "Could not extract text from resume PDF"}), 400
+    # Supports two modes:
+    # 1) multipart/form-data (legacy): resume_file + jd_file/jd_text
+    # 2) application/json (Render-safe): resume_text + jd_text (frontend extracts PDF text)
+    resume_file = None
+    resume_raw = None
+    resume_kind = "text"
+    resume_text = ""
+    jd_text = ""
+    jd_file = None
 
-    jd_text = (request.form.get("jd_text") or "").strip()
-    jd_file = request.files.get("jd_file")
-    if (not jd_text) and jd_file:
-        jd_text = _extract_pdf_text_bytes(jd_file.read() or b"")
-    if not jd_text:
-        return jsonify({"error": "Provide jd_text or jd_file (PDF)"}), 400
+    company = ""
+    role = ""
 
-    company = (request.form.get("company") or "").strip()
-    role = (request.form.get("role") or "").strip()
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+        resume_text = (payload.get("resume_text") or payload.get("resume") or "").strip()
+        jd_text = (payload.get("jd_text") or payload.get("jd") or "").strip()
+        company = (payload.get("company") or "").strip()
+        role = (payload.get("role") or "").strip()
+
+        if not resume_text:
+            return jsonify({"error": "resume_text is required"}), 400
+        if not jd_text:
+            return jsonify({"error": "jd_text is required"}), 400
+    else:
+        resume_file = request.files.get("resume_file")
+        if not resume_file:
+            return jsonify({"error": "resume_file is required"}), 400
+        resume_text, resume_kind, resume_raw = _extract_resume_text(resume_file)
+        if not resume_text:
+            return jsonify({"error": "Could not extract text from resume PDF"}), 400
+
+        jd_text = (request.form.get("jd_text") or "").strip()
+        jd_file = request.files.get("jd_file")
+        if (not jd_text) and jd_file:
+            jd_text = _extract_pdf_text_bytes(jd_file.read() or b"")
+        if not jd_text:
+            return jsonify({"error": "Provide jd_text or jd_file (PDF)"}), 400
+
+        company = (request.form.get("company") or "").strip()
+        role = (request.form.get("role") or "").strip()
     title = f"{company}-{role}".strip("-").strip() if (company or role) else "ATS Session"
 
     jd_source = "text"
@@ -6878,7 +6902,7 @@ def ats_analyze():
             # if Gemini returned key names, map them
             sec_norm = sec.lower().strip()
             sec_title = key_to_title.get(sec_norm, sec or "Section")
-            oldc = (b.get("old_content") or "").strip()
+            oldc = (b.get("old_content") or resume_sections.get(sec_norm) or "").strip()
             newc = (b.get("new_content") or "").strip()
             if not newc:
                 continue
@@ -6912,21 +6936,18 @@ def ats_analyze():
     tailored_sections = (tips.get("tailored_sections") or {}) if isinstance(tips, dict) else {}
 
     # Store a reusable DOCX template for download (keeps the user's template)
+    # Render-safe: only preserve template when the user uploads DOCX.
+    # (Do NOT attempt PDF->DOCX conversion here; it can cause OOM on small instances.)
     fs = gridfs.GridFS(get_db())
     template_file_id = None
     try:
-        if resume_kind == "docx":
-            template_bytes = resume_raw
-        else:
-            converted = _pdf_bytes_to_docx_document(resume_raw)
-            if converted is not None:
-                bio_buf = io.BytesIO()
-                converted.save(bio_buf)
-                template_bytes = bio_buf.getvalue()
-            else:
-                template_bytes = None
+        template_bytes = resume_raw if resume_kind == "docx" else None
         if template_bytes:
-            template_file_id = fs.put(template_bytes, filename=f"template_{uid}_{int(time.time())}.docx", contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            template_file_id = fs.put(
+                template_bytes,
+                filename=f"template_{uid}_{int(time.time())}.docx",
+                contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
     except Exception:
         template_file_id = None
 
@@ -7320,15 +7341,11 @@ def ats_tailor_docx():
         except Exception:
             doc = Document()
     else:
-        # PDF: try to convert to DOCX first (best-effort), then preserve that converted template.
-        converted = _pdf_bytes_to_docx_document(resume_raw)
-        if converted is not None:
-            doc = converted
-        else:
-            # Fallback: PDF cannot preserve exact template; create a clean docx
-            doc = Document()
-            doc.add_paragraph("TAILORED RESUME")
-            doc.add_paragraph("")
+        # Render-safe: do NOT attempt PDF->DOCX conversion (can cause OOM on small instances).
+        # We still return a clean DOCX with the tailored content.
+        doc = Document()
+        doc.add_paragraph("TAILORED RESUME")
+        doc.add_paragraph("")
 
     # Replace common sections (best-effort)
     _docx_replace_section(doc, [r"summary", r"professional summary", r"objective"], summary_lines, bullet=False)

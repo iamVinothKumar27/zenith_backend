@@ -1,124 +1,114 @@
 {
-  "name": "Angular JS advanced custom directives examples",
+  "name": "React JS context API large scale projects",
   "children": [
     {
-      "name": "Web Development Overview",
+      "name": "Core React Hooks",
       "children": [
         {
-          "name": "Business Need for Websites"
-        },
-        {
-          "name": "Job Market (2017 & Future)"
-        },
-        {
-          "name": "Speaker Profile",
+          "name": "useState Hook",
           "children": [
             {
-              "name": "Waseem"
+              "name": "Purpose",
+              "children": [
+                { "name": "Add state to functional components" },
+                { "name": "Component memory" }
+              ]
             },
             {
-              "name": "Microsoft Most Valuable Professional"
+              "name": "State Definition",
+              "children": [
+                { "name": "Data changes over time" },
+                { "name": "Affects component rendering/behavior" }
+              ]
             },
             {
-              "name": "16 International Awards"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "HTML Evolution Timeline",
-      "children": [
-        {
-          "name": "HTML 1.0 (Static Web)"
-        },
-        {
-          "name": "HTML 2.0 (1995, Dynamic Web)",
-          "children": [
-            {
-              "name": "Data Feed & Storage"
+              "name": "Returns Array",
+              "children": [
+                { "name": "Current state value" },
+                { "name": "Setter function (setState)" }
+              ]
             },
             {
-              "name": "Dynamic Images"
-            }
-          ]
-        },
-        {
-          "name": "HTML 3.0 (1997, Visual Enhancements)"
-        },
-        {
-          "name": "HTML 4.0 (1998, Responsive Web)",
-          "children": [
-            {
-              "name": "Extensible HTML (XHTML)"
+              "name": "setState Function",
+              "children": [
+                { "name": "Takes new value" },
+                { "name": "Takes callback (previous state)" }
+              ]
             },
             {
-              "name": "Mobile Compatibility"
-            },
-            {
-              "name": "Increased Interactivity"
+              "name": "Examples",
+              "children": [
+                { "name": "Counter increment" },
+                { "name": "Controlled input (text field)" }
+              ]
             }
           ]
         },
         {
-          "name": "HTML 5.0 (2014, Advanced Web)",
+          "name": "useEffect Hook",
           "children": [
             {
-              "name": "Semantic Web (Meaningful Tags)"
+              "name": "Purpose",
+              "children": [
+                { "name": "Perform side effects" },
+                { "name": "Manage component lifecycle" }
+              ]
             },
             {
-              "name": "Single Page Application (SPA)"
+              "name": "Arguments",
+              "children": [
+                { "name": "Callback function" },
+                { "name": "Dependency array (optional)" }
+              ]
             },
             {
-              "name": "Enhanced Mobile Compatibility"
+              "name": "Dependency Array Behavior",
+              "children": [
+                { "name": "No array: Runs on every render" },
+                { "name": "Empty array []: Runs once on mount" },
+                { "name": "With dependencies [dep]: Runs when dep changes" }
+              ]
             },
             {
-              "name": "Greater Interactivity"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "Modern Web Technologies",
-      "children": [
-        {
-          "name": "AngularJS (Single Page Apps)",
-          "children": [
-            {
-              "name": "Dominates Industry (Next 5 years)"
-            }
-          ]
-        },
-        {
-          "name": "Bootstrap (Mobile Compatibility)",
-          "children": [
-            {
-              "name": "Responsive Visualization"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "Key Modern Web Concepts",
-      "children": [
-        {
-          "name": "Single Page Application (SPA)",
-          "children": [
-            {
-              "name": "Entire Site on One Page"
+              "name": "Cleanup Function",
+              "children": [
+                { "name": "Returned from callback" },
+                { "name": "Runs on unmount" },
+                { "name": "Runs before re-running effect" },
+                { "name": "Example: Clear timer (clearInterval)" }
+              ]
             },
             {
-              "name": "Faster User Experience"
+              "name": "Primary Use Case",
+              "children": [
+                { "name": "Data fetching (empty dependency array)" }
+              ]
             }
           ]
         },
         {
-          "name": "Responsive Design",
+          "name": "useLayoutEffect Hook",
           "children": [
             {
-              "name": "Adapts to Devices (Laptop, iPad, Mobile)"
+              "name": "Purpose",
+              "children": [
+                { "name": "Similar to useEffect" },
+                { "name": "Runs synchronously before browser paints" }
+              ]
+            },
+            {
+              "name": "Execution Order",
+              "children": [
+                { "name": "useLayoutEffect runs first" },
+                { "name": "Then useEffect runs" }
+              ]
+            },
+            {
+              "name": "Usage",
+              "children": [
+                { "name": "Rarely used in typical apps" },
+                { "name": "For DOM measurements, synchronous updates" }
+              ]
             }
           ]
         }

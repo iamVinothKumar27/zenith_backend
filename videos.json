@@ -2,60 +2,100 @@
   {
     "Week 1": [
       {
-        "topic": "Machine Learning end to end project workflow advanced",
-        "video": "https://www.youtube.com/watch?v=761SQ9Hxbic"
+        "topic": "Angular JS large scale application architecture",
+        "video": "https://www.youtube.com/watch?v=a6E5pzst2YE"
       },
       {
-        "topic": "Machine Learning feature engineering for complex projects best practices",
-        "video": "https://www.youtube.com/watch?v=ZXiruGOCn9s"
+        "topic": "Angular JS modular design patterns project",
+        "video": "https://www.youtube.com/watch?v=8MjVAVQ7fyY"
       },
       {
-        "topic": "Machine Learning custom model architecture design for unique projects",
-        "video": "https://www.youtube.com/watch?v=F5RrybksQ2Y"
+        "topic": "Angular JS advanced custom directive creation",
+        "video": "https://www.youtube.com/watch?v=dADWO1Wh6-4"
       },
       {
-        "topic": "Machine Learning transfer learning finetuning for project specific tasks",
-        "video": "https://www.youtube.com/watch?v=bZcKYiwtw1I"
+        "topic": "Angular JS component communication strategies project",
+        "video": "https://www.youtube.com/watch?v=n1a2eQ0Zyls"
       },
       {
-        "topic": "Machine Learning explainable AI LIME SHAP for project interpretation",
-        "video": "https://www.youtube.com/watch?v=It2Q1eK_Klc"
+        "topic": "Angular JS performance optimization techniques",
+        "video": "https://www.youtube.com/watch?v=d5eIU5PEH8A"
       },
       {
-        "topic": "Machine Learning MLOps pipeline setup for production projects",
-        "video": "https://www.youtube.com/watch?v=6kEGUCrBEU0"
+        "topic": "Angular JS digest cycle performance tuning",
+        "video": "No video found"
       },
       {
-        "topic": "Machine Learning model deployment serverless functions for projects",
-        "video": "https://www.youtube.com/watch?v=mJJpZ70q9M0"
+        "topic": "Angular JS lazy loading modules project implementation",
+        "video": "https://www.youtube.com/watch?v=ua2NONiy-7A"
       },
       {
-        "topic": "Machine Learning real time inference optimization for project applications",
-        "video": "https://www.youtube.com/watch?v=00Q0G84kq3M"
+        "topic": "Angular JS memory leak debugging real world",
+        "video": "No video found"
       },
       {
-        "topic": "Machine Learning federated learning implementation for privacy projects",
-        "video": "https://www.youtube.com/watch?v=qiUEgSCyY5o"
+        "topic": "Angular JS advanced data binding complex forms",
+        "video": "https://www.youtube.com/watch?v=iiADhChRriM"
       },
       {
-        "topic": "Machine Learning reinforcement learning project environments advanced",
-        "video": "https://www.youtube.com/watch?v=C2zw2H1c5Fk"
+        "topic": "Angular JS state management patterns large apps",
+        "video": "https://www.youtube.com/watch?v=59mWuOXs3dU"
       },
       {
-        "topic": "Machine Learning generative adversarial networks GAN project examples",
-        "video": "https://www.youtube.com/watch?v=TpMIssRdhco"
+        "topic": "Angular JS RxJS observables integration project",
+        "video": "https://www.youtube.com/watch?v=k5S-hGkFL70"
       },
       {
-        "topic": "Machine Learning graph neural networks GNN project applications",
-        "video": "https://www.youtube.com/watch?v=y7sXDpffzQQ"
+        "topic": "Angular JS real time application web sockets",
+        "video": "https://www.youtube.com/watch?v=1BfCnjr_Vjg"
       },
       {
-        "topic": "Machine Learning ethical considerations fairness in project development",
-        "video": "https://www.youtube.com/watch?v=aGwYtUzMQUk"
+        "topic": "Angular JS end to end testing Protractor advanced",
+        "video": "https://www.youtube.com/watch?v=0PqHyqA1PJU"
       },
       {
-        "topic": "Machine Learning scalable data pipelines for large projects",
-        "video": "https://www.youtube.com/watch?v=bAyrObl7TYE"
+        "topic": "Angular JS unit testing services controllers mocks",
+        "video": "https://www.youtube.com/watch?v=XVFqOFKGeGM"
+      },
+      {
+        "topic": "Angular JS CI CD pipeline setup production",
+        "video": "https://www.youtube.com/watch?v=J9JbzsufemE"
+      },
+      {
+        "topic": "Angular JS Webpack configuration optimization",
+        "video": "https://www.youtube.com/watch?v=GfeUrQ-xQN4"
+      },
+      {
+        "topic": "Angular JS security best practices XSS CSRF",
+        "video": "https://www.youtube.com/watch?v=eWEgUcHPle0"
+      },
+      {
+        "topic": "Angular JS authentication authorization project implementation",
+        "video": "https://www.youtube.com/watch?v=GcVtElYa17s"
+      },
+      {
+        "topic": "Angular JS error handling logging strategies",
+        "video": "https://www.youtube.com/watch?v=9RksQ5YT7FM"
+      },
+      {
+        "topic": "Angular JS deployment strategies production",
+        "video": "https://www.youtube.com/watch?v=0M8AYU_hPas"
+      },
+      {
+        "topic": "Angular JS server side rendering SSR benefits",
+        "video": "https://www.youtube.com/watch?v=LrEqJUCwEyY"
+      },
+      {
+        "topic": "Angular JS advanced UI component libraries integration",
+        "video": "https://www.youtube.com/watch?v=k5E2AVpwsko"
+      },
+      {
+        "topic": "Angular JS Micro Frontends architecture patterns",
+        "video": "https://www.youtube.com/watch?v=gOuAqRaDdHA"
+      },
+      {
+        "topic": "Angular JS upgrading legacy applications guide",
+        "video": "https://www.youtube.com/watch?v=Us8CXant1M4"
       }
     ]
   }
