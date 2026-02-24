@@ -12,7 +12,6 @@ firebase-admin
 PyPDF2
 gunicorn==22.0.0
 python-docx
-pdf2docx==0.5.8
 
 # keep numpy <2 for mac compatibility with other libs
 numpy<2

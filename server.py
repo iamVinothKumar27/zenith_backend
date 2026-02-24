@@ -5339,12 +5339,16 @@ def _docx_replace_section(doc: Document, heading_patterns, new_paras, bullet: bo
 
 
 def _pdf_bytes_to_docx_document(pdf_bytes: bytes):
-    """Lightweight best-effort PDF -> python-docx Document.
+    """Extract text from a *text-based* PDF and return a python-docx Document.
 
-    We avoid pdf2docx/PyMuPDF on hosted environments because they can be heavy to import
-    and may trigger worker timeouts / OOM on small instances. Instead, we extract text
-    using PyPDF2 (already in requirements) and build a simple DOCX.
-    Returns a python-docx Document if extraction succeeds with non-empty text, else None.
+    Why this exists:
+    - `pdf2docx` pulls in PyMuPDF (`fitz`) and can spike memory on small instances
+      (Render free/low-RAM plans), causing worker SIGKILL/OOM.
+    - For ATS we only need readable text, not layout-perfect conversion.
+
+    Returns:
+      - Document(...) when text extraction succeeds
+      - None when PDF is empty / scanned / text extraction fails
     """
     if not pdf_bytes:
         return None
@@ -5355,24 +5359,24 @@ def _pdf_bytes_to_docx_document(pdf_bytes: bytes):
 
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        parts = []
-        for page in reader.pages:
+        pages_text = []
+        for p in getattr(reader, "pages", []) or []:
             try:
-                t = page.extract_text() or ""
+                t = p.extract_text() or ""
             except Exception:
                 t = ""
             if t:
-                parts.append(t)
-        full_text = "\n".join(parts).strip()
-        if not full_text:
+                pages_text.append(t)
+
+        text = "\n".join(pages_text).strip()
+        if not text:
             return None
 
         doc = Document()
-        # Preserve paragraph breaks reasonably
-        for para in re.split(r"\n\s*\n", full_text):
-            p = (para or "").strip()
-            if p:
-                doc.add_paragraph(p)
+        for line in text.splitlines():
+            ln = (line or "").strip()
+            if ln:
+                doc.add_paragraph(ln)
         return doc
     except Exception:
         return None
