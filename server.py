@@ -992,13 +992,6 @@ CORS(
 )
 
 
-# ----------------- BASIC HEALTH -----------------
-# Uptime monitors often probe HEAD/GET /. Return 200 so deployments don't look "down".
-@app.route("/", methods=["GET", "HEAD"])
-def root_health():
-    return ("OK", 200)
-
-
 # ----------------- AUTH: SYNC FIREBASE USER TO MONGODB -----------------
 @app.route("/auth/firebase", methods=["POST"])
 def auth_firebase():
@@ -3175,21 +3168,9 @@ def _extract_topic_keywords(topic: str) -> set:
     return {w for w in words if w not in stop}
 
 def get_gemini_response(input_prompt: str) -> str:
-    # NOTE:
-    # Hosted deployments (e.g., Render + Gunicorn) can hit worker timeouts if LLM calls
-    # take too long. Keep latency predictable by enforcing an API timeout and limiting
-    # output tokens.
     model = genai.GenerativeModel("gemini-2.5-flash")
     try:
-        response = model.generate_content(
-            input_prompt,
-            generation_config={
-                "temperature": 0.2,
-                "max_output_tokens": 1400,
-            },
-            # google-generativeai supports request_options with timeout (seconds)
-            request_options={"timeout": 22},
-        )
+        response = model.generate_content(input_prompt)
     except Exception as e:
         # Surface quota/rate errors with a consistent message so the UI can show it.
         if is_quota_error(e):
@@ -5358,46 +5339,43 @@ def _docx_replace_section(doc: Document, heading_patterns, new_paras, bullet: bo
 
 
 def _pdf_bytes_to_docx_document(pdf_bytes: bytes):
-    """Best-effort PDF -> DOCX conversion using pdf2docx.
-    Returns a python-docx Document if conversion succeeds, else None.
-    NOTE: Only text-based PDFs convert well; scanned PDFs may lose layout.
+    """Lightweight best-effort PDF -> python-docx Document.
+
+    We avoid pdf2docx/PyMuPDF on hosted environments because they can be heavy to import
+    and may trigger worker timeouts / OOM on small instances. Instead, we extract text
+    using PyPDF2 (already in requirements) and build a simple DOCX.
+    Returns a python-docx Document if extraction succeeds with non-empty text, else None.
     """
     if not pdf_bytes:
         return None
     try:
-        from pdf2docx import Converter  # type: ignore
+        from PyPDF2 import PdfReader  # type: ignore
     except Exception:
         return None
 
-    pdf_path = None
-    docx_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fpdf:
-            fpdf.write(pdf_bytes)
-            pdf_path = fpdf.name
-        docx_path = pdf_path + ".docx"
-
-        cv = Converter(pdf_path)
-        try:
-            cv.convert(docx_path, start=0, end=None)
-        finally:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        parts = []
+        for page in reader.pages:
             try:
-                cv.close()
+                t = page.extract_text() or ""
             except Exception:
-                pass
+                t = ""
+            if t:
+                parts.append(t)
+        full_text = "\n".join(parts).strip()
+        if not full_text:
+            return None
 
-        with open(docx_path, "rb") as fdocx:
-            docx_bytes = fdocx.read()
-        return Document(io.BytesIO(docx_bytes))
+        doc = Document()
+        # Preserve paragraph breaks reasonably
+        for para in re.split(r"\n\s*\n", full_text):
+            p = (para or "").strip()
+            if p:
+                doc.add_paragraph(p)
+        return doc
     except Exception:
         return None
-    finally:
-        for p in (docx_path, pdf_path):
-            try:
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
 
 
 def _build_gemini_tailor_prompt(jd_struct: dict, resume_struct: dict, ats_struct: dict, jd_text: str, resume_text: str) -> str:
