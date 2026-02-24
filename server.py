@@ -992,6 +992,13 @@ CORS(
 )
 
 
+# ----------------- BASIC HEALTH -----------------
+# Uptime monitors often probe HEAD/GET /. Return 200 so deployments don't look "down".
+@app.route("/", methods=["GET", "HEAD"])
+def root_health():
+    return ("OK", 200)
+
+
 # ----------------- AUTH: SYNC FIREBASE USER TO MONGODB -----------------
 @app.route("/auth/firebase", methods=["POST"])
 def auth_firebase():
@@ -3168,9 +3175,21 @@ def _extract_topic_keywords(topic: str) -> set:
     return {w for w in words if w not in stop}
 
 def get_gemini_response(input_prompt: str) -> str:
+    # NOTE:
+    # Hosted deployments (e.g., Render + Gunicorn) can hit worker timeouts if LLM calls
+    # take too long. Keep latency predictable by enforcing an API timeout and limiting
+    # output tokens.
     model = genai.GenerativeModel("gemini-2.5-flash")
     try:
-        response = model.generate_content(input_prompt)
+        response = model.generate_content(
+            input_prompt,
+            generation_config={
+                "temperature": 0.2,
+                "max_output_tokens": 1400,
+            },
+            # google-generativeai supports request_options with timeout (seconds)
+            request_options={"timeout": 22},
+        )
     except Exception as e:
         # Surface quota/rate errors with a consistent message so the UI can show it.
         if is_quota_error(e):
