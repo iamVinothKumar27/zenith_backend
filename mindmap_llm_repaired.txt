@@ -1,15 +1,125 @@
 {
-  "name": "Advanced Array Problems Sliding Window Data Structures For Placements",
+  "name": "Angular JS advanced custom directives examples",
   "children": [
     {
-      "name": "Definition & Purpose",
+      "name": "Web Development Overview",
       "children": [
         {
-          "name": "What is Sliding Window?",
+          "name": "Business Need for Websites"
+        },
+        {
+          "name": "Job Market (2017 & Future)"
+        },
+        {
+          "name": "Speaker Profile",
           "children": [
-            {"name": "Window over linear structure", "children": []},
-            {"name": "Slides across array/string", "children": []},
-            {"name": "Processes contiguous segments", "children": []}
+            {
+              "name": "Waseem"
+            },
+            {
+              "name": "Microsoft Most Valuable Professional"
+            },
+            {
+              "name": "16 International Awards"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "HTML Evolution Timeline",
+      "children": [
+        {
+          "name": "HTML 1.0 (Static Web)"
+        },
+        {
+          "name": "HTML 2.0 (1995, Dynamic Web)",
+          "children": [
+            {
+              "name": "Data Feed & Storage"
+            },
+            {
+              "name": "Dynamic Images"
+            }
+          ]
+        },
+        {
+          "name": "HTML 3.0 (1997, Visual Enhancements)"
+        },
+        {
+          "name": "HTML 4.0 (1998, Responsive Web)",
+          "children": [
+            {
+              "name": "Extensible HTML (XHTML)"
+            },
+            {
+              "name": "Mobile Compatibility"
+            },
+            {
+              "name": "Increased Interactivity"
+            }
+          ]
+        },
+        {
+          "name": "HTML 5.0 (2014, Advanced Web)",
+          "children": [
+            {
+              "name": "Semantic Web (Meaningful Tags)"
+            },
+            {
+              "name": "Single Page Application (SPA)"
+            },
+            {
+              "name": "Enhanced Mobile Compatibility"
+            },
+            {
+              "name": "Greater Interactivity"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Modern Web Technologies",
+      "children": [
+        {
+          "name": "AngularJS (Single Page Apps)",
+          "children": [
+            {
+              "name": "Dominates Industry (Next 5 years)"
+            }
+          ]
+        },
+        {
+          "name": "Bootstrap (Mobile Compatibility)",
+          "children": [
+            {
+              "name": "Responsive Visualization"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Key Modern Web Concepts",
+      "children": [
+        {
+          "name": "Single Page Application (SPA)",
+          "children": [
+            {
+              "name": "Entire Site on One Page"
+            },
+            {
+              "name": "Faster User Experience"
+            }
+          ]
+        },
+        {
+          "name": "Responsive Design",
+          "children": [
+            {
+              "name": "Adapts to Devices (Laptop, iPad, Mobile)"
+            }
           ]
         }
       ]

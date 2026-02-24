@@ -1,5 +1,5 @@
 # server.py
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, send_file
 from flask_cors import CORS
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -7,15 +7,19 @@ from supadata import Supadata
 
 from PyPDF2 import PdfReader
 
+import requests
+from docx import Document
 from dotenv import load_dotenv
 import google.generativeai as genai
 
-import os, json, re
+import os, json, re, io, tempfile
+from html import escape as _html_escape
 import time
 import uuid
 import math
 
 import hashlib
+from collections import deque
 from datetime import datetime, timezone, timedelta
 
 # ---- datetime helpers (avoid naive vs aware issues) ----
@@ -38,6 +42,12 @@ import firebase_admin
 from firebase_admin import credentials as fb_credentials
 from firebase_admin import auth as fb_auth
 load_dotenv()  
+
+# ----------------- MOCKTEST DEDUPE CACHES -----------------
+# Keep a short rolling window to reduce repeated questions across sessions.
+RECENT_CODING_TITLES = deque(maxlen=200)
+RECENT_MCQ_HASHES = deque(maxlen=400)
+
 
 # ----------------- EMAIL (SMTP: Titan/GoDaddy etc.) -----------------
 import smtplib
@@ -101,7 +111,6 @@ def derive_video_number_from_course(db, uid: str, course_title: str, video_url: 
 
     def _flatten_video_urls(node):
         out = []
-
         if node is None:
             return out
 
@@ -128,14 +137,12 @@ def derive_video_number_from_course(db, uid: str, course_title: str, video_url: 
                         out.append(u)
                     else:
                         out.extend(_flatten_video_urls(v))
-                return out
 
             # B) build_weekly_json: {"Week 1": [ {topic, video}, ... ]}
             for k, v in node.items():
                 if isinstance(v, list):
-                    # likely week list
                     for item in v:
-                        u = _get_url(item)  # ✅ reads "video" key
+                        u = _get_url(item)  # reads "video" key too
                         if u:
                             out.append(u)
                         else:
@@ -144,6 +151,7 @@ def derive_video_number_from_course(db, uid: str, course_title: str, video_url: 
                     out.extend(_flatten_video_urls(v))
             return out
 
+        # fallback: unknown type
         return out
 
     # ✅ pull weeks/videos from all possible places
@@ -167,6 +175,125 @@ def derive_video_number_from_course(db, uid: str, course_title: str, video_url: 
 
     return (None, total)
 
+def derive_video_meta_from_course(db, uid: str, course_title: str, video_url: str):
+    """Like derive_video_number_from_course, but also returns the video's title (if available).
+
+    Returns (video_no, total_videos, video_title)
+    """
+    if not uid or not course_title or not video_url:
+        return (None, None, None)
+
+    target_id = _yt_id(video_url) or video_url.strip()
+
+    state = db.course_states.find_one(
+        {"uid": uid, "courseTitle": course_title},
+        {"videos": 1, "weeks": 1, "course": 1}
+    )
+    if not state:
+        return (None, None, None)
+
+    videos_root = state.get("videos")
+    if not videos_root and isinstance(state.get("course"), dict):
+        videos_root = state["course"].get("videos") or state["course"].get("weeks")
+    if not videos_root:
+        videos_root = state.get("weeks")
+
+    entries = flatten_course_videos_with_titles(videos_root)
+    if not entries:
+        return (None, None, None)
+
+    total = len(entries)
+    for idx, ent in enumerate(entries, start=1):
+        vurl = (ent.get("url") or "").strip()
+        vid = _yt_id(vurl) or vurl
+        if vid and target_id and vid == target_id:
+            return (idx, total, (ent.get("title") or f"Video {idx}"))
+
+    return (None, total, None)
+
+
+def flatten_course_videos_with_titles(videos_root):
+    """Flatten course videos into an ordered list of {url, title}.
+
+    Supports multiple schemas:
+      - build_weekly_json: [{"Week 1":[{"topic":..., "video":...}, ...]}, ...]
+      - {"week":"Week 1","videos":[{"title":..., "videoUrl":...}, ...]}
+      - flat list of strings / dicts
+    """
+    def _get_url(obj):
+        if obj is None:
+            return ""
+        if isinstance(obj, str):
+            return obj.strip()
+        if isinstance(obj, dict):
+            return (obj.get("videoUrl")
+                    or obj.get("video_url")
+                    or obj.get("url")
+                    or obj.get("video")
+                    or "").strip()
+        return str(obj).strip()
+
+    def _get_title(obj):
+        if obj is None:
+            return ""
+        if isinstance(obj, dict):
+            return (obj.get("title")
+                    or obj.get("topic")
+                    or obj.get("name")
+                    or obj.get("videoTitle")
+                    or obj.get("heading")
+                    or "").strip()
+        return ""
+
+    out = []
+
+    def _push(url, title):
+        u = (url or "").strip()
+        if not u:
+            return
+        t = (title or "").strip()
+        out.append({"url": u, "title": t})
+
+    def _walk(node, inherited_title=""):
+        if node is None:
+            return
+        if isinstance(node, str):
+            _push(node, inherited_title)
+            return
+        if isinstance(node, list):
+            for it in node:
+                _walk(it, inherited_title)
+            return
+        if isinstance(node, dict):
+            # If this dict itself is a video entry
+            u = _get_url(node)
+            t = _get_title(node) or inherited_title
+            if u:
+                _push(u, t)
+                return
+
+            # Schema: {"videos":[...]}
+            if isinstance(node.get("videos"), list):
+                for v in node.get("videos"):
+                    _walk(v, inherited_title=_get_title(v) or inherited_title)
+                return
+
+            # build_weekly_json: {"Week 1":[...]}
+            for k, v in node.items():
+                if isinstance(v, list):
+                    for item in v:
+                        _walk(item, inherited_title=_get_title(item) or inherited_title)
+                else:
+                    _walk(v, inherited_title=inherited_title)
+            return
+
+    _walk(videos_root, "")
+    # Fill missing titles with Video N
+    for i, ent in enumerate(out, start=1):
+        if not ent.get("title"):
+            ent["title"] = f"Video {i}"
+    return out
+
 SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
@@ -180,6 +307,8 @@ MAIL_FROM_COURSES = (os.getenv("MAIL_FROM_COURSES") or "courses@zenithlearning.s
 MAIL_FROM_PROFILE = (os.getenv("MAIL_FROM_PROFILE") or "profile@zenithlearning.site").strip()
 MAIL_FROM_ADMIN = (os.getenv("MAIL_FROM_ADMIN") or "admin@zenithlearning.site").strip()
 MAIL_FROM_CONTACT = (os.getenv("MAIL_FROM_CONTACT") or "contact@zenithlearning.site").strip()
+MAIL_FROM_MOCKTEST = (os.getenv("MAIL_FROM_MOCKTEST") or os.getenv("MAIL_FROM_TESTS") or "mock-tests@zenithlearning.site").strip()
+MAIL_FROM_ATS = (os.getenv("MAIL_FROM_ATS") or os.getenv("MAIL_FROM_ATS_INTELLIGENCE") or "ats-intelligence@zenithlearning.site").strip()
 
 # Optional: use SendGrid API instead of SMTP (kept for safety, but Mailgun removed)
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY", "").strip()
@@ -187,36 +316,34 @@ SENDGRID_FROM = os.getenv("SENDGRID_FROM", "").strip()
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", os.getenv("FRONTEND_URL", "")).strip().rstrip("/")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@zenithlearning.site").strip()
+ADMIN_EMAILS = os.getenv("ADMIN_EMAILS", "").strip()
+
+
+def _admin_email_set():
+    """Return a lowercase set of admin emails.
+
+    Supports ADMIN_EMAILS as comma-separated list. Falls back to ADMIN_EMAIL.
+    """
+    s=set()
+    if ADMIN_EMAIL: s.add(ADMIN_EMAIL.strip().lower())
+    if ADMIN_EMAILS:
+        for e in ADMIN_EMAILS.split(','):
+            e=e.strip().lower()
+            if e: s.add(e)
+    return s
+
 CONTACT_INBOX = os.getenv("CONTACT_INBOX", "contact@zenithlearning.site").strip()
 
 
 def _smtp_ready() -> bool:
-    """Return True if SMTP config is usable (reads from env at call time)."""
-    host = (os.getenv("SMTP_HOST", "") or "").strip()
-    port_raw = (os.getenv("SMTP_PORT", "") or "").strip()
-    user = (os.getenv("SMTP_USER", "") or "").strip()
-    pw = (os.getenv("SMTP_PASS", "") or "").strip()
+    return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS)
 
-    try:
-        port = int(port_raw) if port_raw else 587
-    except Exception:
-        port = 587
 
-    if host and port and user and pw:
-        return True
+def _mailgun_ready() -> bool:
+    api_key = (os.getenv("MAILGUN_API_KEY") or "").strip()
+    domain = (os.getenv("MAILGUN_DOMAIN") or "").strip()
+    return bool(api_key and domain)
 
-    # Local/no-auth mode
-    no_auth = (os.getenv("SMTP_NO_AUTH", "").strip().lower() in ("1", "true", "yes", "y"))
-    local_host = host.lower() in ("localhost", "127.0.0.1")
-    local_smtp_host = (os.getenv("LOCAL_SMTP_HOST", "").strip() or "").lower() in ("localhost", "127.0.0.1")
-    if host and port and (no_auth or local_host or local_smtp_host):
-        return True
-
-    # If LOCAL_SMTP_HOST/PORT are provided, treat that as SMTP ready (no auth)
-    if os.getenv("LOCAL_SMTP_HOST", "").strip() and os.getenv("LOCAL_SMTP_PORT", "").strip():
-        return True
-
-    return False
 def _pick_from(kind: str = "") -> str:
     k = (kind or "").strip().lower()
     if k in ("auth", "authentication", "login"):
@@ -229,7 +356,41 @@ def _pick_from(kind: str = "") -> str:
         return MAIL_FROM_ADMIN or MAIL_FROM_DEFAULT
     if k in ("contact",):
         return MAIL_FROM_CONTACT or MAIL_FROM_DEFAULT
+    if k in ("mocktest","mock-tests","tests","mock_test"):
+        return MAIL_FROM_MOCKTEST or MAIL_FROM_DEFAULT
+    if k in ("ats","ats-intelligence","ats_intelligence"):
+        return MAIL_FROM_ATS or MAIL_FROM_DEFAULT
     return MAIL_FROM_DEFAULT or SMTP_USER
+
+
+def _is_local_dev() -> bool:
+    """Best-effort detection: treat localhost/dev as local."""
+    try:
+        from flask import has_request_context, request
+        if has_request_context():
+            host = (request.host or "").lower()
+            if host.startswith("127.0.0.1") or host.startswith("localhost"):
+                return True
+    except Exception:
+        pass
+
+    env = (os.getenv("APP_ENV") or os.getenv("FLASK_ENV") or "").lower()
+    if env in ("dev", "development", "local"):
+        return True
+
+    web = (os.getenv("FRONTEND_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or "").lower()
+    if "localhost" in web or "127.0.0.1" in web:
+        return True
+
+    # Render/Vercel/etc set env vars; if present, assume hosted.
+    if os.getenv("RENDER") or os.getenv("VERCEL") or os.getenv("RAILWAY_STATIC_URL") or os.getenv("FLY_APP_NAME"):
+        return False
+
+    return False
+
+def _should_use_mailgun() -> bool:
+    return _preferred_mail_provider() == "mailgun"
+
 
 def _send_email_sync_smtp(
     to_email: str,
@@ -243,22 +404,17 @@ def _send_email_sync_smtp(
     """Send email via SMTP. Returns True if sent, False otherwise.
 
     Notes:
-    - When using Google Workspace SMTP, authenticate with user (primary mailbox),
+    - When using Google Workspace SMTP, authenticate with SMTP_USER (primary mailbox),
       and set From to one of its verified aliases (courses@, profile@, etc.).
     - For contact form, prefer setting Reply-To to the user's email.
     """
     if not to_email:
         return False
-    host = (os.getenv("host", "") or "").strip()
-    port = (os.getenv("port", "") or "").strip()
-    user = (os.getenv("user", "") or "").strip()
-    pw = (os.getenv("pw", "") or "").strip()
-
     if not _smtp_ready():
         print("[MAIL] SMTP not configured. Skipping send to:", to_email, "subject:", subject)
         return False
 
-    sender = (from_email or MAIL_FROM_DEFAULT or user).strip()
+    sender = (from_email or MAIL_FROM_DEFAULT or SMTP_USER).strip()
 
     msg = MIMEMultipart("alternative")
     msg["From"] = f"Zenith Learning <{sender}>"
@@ -276,11 +432,11 @@ def _send_email_sync_smtp(
 
     server = None
     try:
-        if int(port) == 465:
-            server = smtplib.SMTP_SSL(host, port, timeout=connect_timeout)
+        if int(SMTP_PORT) == 465:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=connect_timeout)
             server.ehlo()
         else:
-            server = smtplib.SMTP(host, port, timeout=connect_timeout)
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=connect_timeout)
             server.ehlo()
             try:
                 server.starttls()
@@ -288,7 +444,7 @@ def _send_email_sync_smtp(
             except Exception:
                 pass
 
-        server.login(user, pw)
+        server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(sender, [to_email], msg.as_string())
         server.quit()
         print("[MAIL] SMTP Sent:", subject, "->", to_email, "| from:", sender)
@@ -362,7 +518,15 @@ def _send_email_sync_sendgrid(to_email: str, subject: str, html_body: str, text_
         return False
 
 
-def _send_email_sync_mailgun(to_email: str, subject: str, html_body: str, text_body: str = "") -> bool:
+def _send_email_sync_mailgun(
+    to_email: str,
+    subject: str,
+    html_body: str,
+    text_body: str = "",
+    *,
+    from_email: str = None,
+    reply_to: str = None,
+) -> bool:
     """Send email via Mailgun HTTP API. Returns True if Mailgun accepted the message."""
     api_key = os.getenv("MAILGUN_API_KEY", "").strip()
     domain = os.getenv("MAILGUN_DOMAIN", "").strip()
@@ -370,15 +534,14 @@ def _send_email_sync_mailgun(to_email: str, subject: str, html_body: str, text_b
         return False
 
     # API base: US (default) or EU (set MAILGUN_BASE_URL=https://api.eu.mailgun.net)
-    base_url_raw = os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net")
-    base_url = (base_url_raw or "").strip().strip('"').strip("'").replace("\\n", "").replace("\n", "").strip().rstrip("/")
-    # If user mistakenly includes '/v3' in MAILGUN_BASE_URL, remove it to avoid '/v3/v3/...'
-    if base_url.endswith('/v3'):
-        base_url = base_url[:-3].rstrip('/')
+    # Some deployments set MAILGUN_BASE_URL with /v3 included (ex: https://api.mailgun.net/v3).
+    base_url = (os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net").strip().rstrip("/"))
+    if base_url.endswith("/v3"):
+        endpoint = f"{base_url}/{domain}/messages"
+    else:
+        endpoint = f"{base_url}/v3/{domain}/messages"
 
-    endpoint = f"{base_url}/v3/{domain}/messages"
-
-    from_email = (os.getenv("MAILGUN_FROM", "").strip() or os.getenv("MAIL_FROM", "").strip() or os.getenv("SMTP_FROM", "").strip() or SMTP_USER).strip()
+    from_email = ((from_email or "").strip() or (os.getenv("MAILGUN_FROM", "").strip() or os.getenv("MAIL_FROM", "").strip() or os.getenv("SMTP_FROM", "").strip() or SMTP_USER).strip())
     if not from_email:
         return False
 
@@ -389,6 +552,8 @@ def _send_email_sync_mailgun(to_email: str, subject: str, html_body: str, text_b
         "text": text_body or " ",
         "html": html_body,
     }
+    if reply_to:
+        data["h:Reply-To"] = reply_to
 
     try:
         import requests  # type: ignore
@@ -445,19 +610,22 @@ def _is_render_env() -> bool:
     )
 
 def _preferred_mail_provider() -> str:
-    """Choose mail provider based on environment.
+    """Choose provider: local -> SMTP, hosted -> Mailgun if configured, else SMTP.
 
-    Rule (as requested):
-    - Localhost/dev  => SMTP
-    - Render/Hosted  => Mailgun (HTTP API)
-
-    You can override with MAIL_PROVIDER=mailgun|smtp (useful for testing).
+    Override with MAIL_PROVIDER=smtp|mailgun|sendgrid or USE_MAILGUN=1.
     """
-    forced = (os.getenv("MAIL_PROVIDER", "") or "").strip().lower()
-    if forced in ("mailgun", "smtp"):
-        return forced
-
-    return "mailgun" if _is_render_env() else "smtp"
+    override = (os.getenv("MAIL_PROVIDER") or "").strip().lower()
+    if override in ("smtp", "mailgun", "sendgrid"):
+        return override
+    if (os.getenv("USE_MAILGUN") or "").strip().lower() in ("1", "true", "yes"):
+        return "mailgun" if _mailgun_ready() else "smtp"
+    if _is_local_dev():
+        return "smtp"
+    if _mailgun_ready():
+        return "mailgun"
+    if os.getenv("SENDGRID_API_KEY", "").strip():
+        return "sendgrid"
+    return "smtp"
 
 def _send_email(
     to_email: str,
@@ -466,56 +634,29 @@ def _send_email(
     text_body: str = "",
     *,
     kind: str = "",
+    from_email: str = None,
     reply_to: str = None,
 ):
     """Send email on a background thread (SMTP only)."""
     if not to_email:
         return
 
-    from_email = _pick_from(kind)
+    from_email = (from_email or _pick_from(kind))
 
     def _job():
         provider = _preferred_mail_provider()
-        # Render/Hosted: use Mailgun; Localhost: skip Mailgun
-        if provider == "mailgun":
-            if _send_email_sync_mailgun(to_email, subject, html_body, text_body):
-                return
 
-        # Optional: SendGrid as secondary (useful if Mailgun is temporarily failing)
-        if provider in ("sendgrid", "auto") and os.getenv("SENDGRID_API_KEY", "").strip():
+        if provider == "sendgrid":
             if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
                 return
+            provider = "mailgun" if _mailgun_ready() else "smtp"
 
-        # Localhost/dev (and final fallback everywhere): SMTP
-        # If LOCAL_SMTP_HOST/PORT are set, use them (no auth).
-        local_host = os.getenv("LOCAL_SMTP_HOST", "").strip()
-        local_port = os.getenv("LOCAL_SMTP_PORT", "").strip()
-        if local_host and local_port:
-            # Temporarily override SMTP settings for this send
-            old_host, old_port = os.getenv("SMTP_HOST"), os.getenv("SMTP_PORT")
-            old_user, old_pass = os.getenv("SMTP_USER"), os.getenv("SMTP_PASS")
-            os.environ["SMTP_HOST"] = local_host
-            os.environ["SMTP_PORT"] = local_port
-            # Ensure no-auth path is allowed
-            os.environ["SMTP_NO_AUTH"] = os.getenv("SMTP_NO_AUTH", "true")
-            os.environ["SMTP_USER"] = os.getenv("SMTP_USER", "")
-            os.environ["SMTP_PASS"] = os.getenv("SMTP_PASS", "")
-            try:
-                _send_email_sync_smtp(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to)
+        if provider == "mailgun":
+            if _send_email_sync_mailgun(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to):
                 return
-            finally:
-                # restore env
-                if old_host is None: os.environ.pop("SMTP_HOST", None)
-                else: os.environ["SMTP_HOST"] = old_host
-                if old_port is None: os.environ.pop("SMTP_PORT", None)
-                else: os.environ["SMTP_PORT"] = old_port
-                if old_user is None: os.environ.pop("SMTP_USER", None)
-                else: os.environ["SMTP_USER"] = old_user
-                if old_pass is None: os.environ.pop("SMTP_PASS", None)
-                else: os.environ["SMTP_PASS"] = old_pass
-        else:
-            _send_email_sync_smtp(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to)
+            provider = "smtp"
 
+        _send_email_sync_smtp(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to)
 
     try:
         import threading
@@ -525,8 +666,46 @@ def _send_email(
         print("[MAIL] Could not spawn mail thread:", e)
         _job()
 
-def _brand_email(title: str, preheader: str = "", body_html: str = "", primary_cta: dict = None, secondary_cta: dict = None):
-    """Return a professional, branded email HTML."""
+    return True
+
+def _brand_email(
+    title: str,
+    preheader: str = "",
+    body_html: str = "",
+    primary_cta: dict = None,
+    secondary_cta: dict = None,
+    # Backward/forward compatible args used in some parts of the app
+    subtitle: str = "",
+    cta_url: str = "",
+    cta_text: str = "",
+    cta2_url: str = "",
+    cta2_text: str = "",
+    **_ignore,
+):
+    """Return a professional, branded email HTML.
+
+    Supports both styles:
+    - primary_cta / secondary_cta dicts
+    - subtitle + cta_url/cta_text (legacy)
+    """
+    # Map legacy CTA args into the newer dict form
+    try:
+        if (not primary_cta) and cta_url and cta_text:
+            u = (cta_url or "").strip()
+            if u.startswith("/"):
+                u = _safe_public_url(u)
+            primary_cta = {"url": u, "label": cta_text}
+        if (not secondary_cta) and cta2_url and cta2_text:
+            u2 = (cta2_url or "").strip()
+            if u2.startswith("/"):
+                u2 = _safe_public_url(u2)
+            secondary_cta = {"url": u2, "label": cta2_text}
+    except Exception:
+        pass
+
+    # Subtitle is what we want to SHOW below the title. Preheader is still used as the hidden inbox preview.
+    visible_subtitle = (subtitle or preheader or "").strip()
+    hidden_preheader = (preheader or subtitle or "").strip()
     logo_text = "Zenith Learning"
     year = datetime.now().year
     primary_btn = ""
@@ -556,7 +735,7 @@ def _brand_email(title: str, preheader: str = "", body_html: str = "", primary_c
     <title>{title}</title>
   </head>
   <body style="margin:0;padding:0;background:#f6f7fb;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#111827;">
-    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">{preheader}</div>
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">{hidden_preheader}</div>
 
     <table width="100%" cellspacing="0" cellpadding="0" style="background:#f6f7fb;padding:28px 10px;">
       <tr>
@@ -572,7 +751,7 @@ def _brand_email(title: str, preheader: str = "", body_html: str = "", primary_c
             <tr>
               <td style="padding:26px 24px 6px 24px;">
                 <div style="font-size:20px;font-weight:800;line-height:1.25;">{title}</div>
-                <div style="font-size:13px;color:#6b7280;margin-top:8px;">{preheader}</div>
+                <div style="font-size:13px;color:#6b7280;margin-top:8px;">{visible_subtitle}</div>
               </td>
             </tr>
 
@@ -683,14 +862,22 @@ def require_user():
 
 
 def require_admin():
-    """Verify token + allow only the fixed admin mailbox (ADMIN_EMAIL)."""
+    """Verify token + allow only configured admin mailboxes.
+
+    - ADMIN_EMAIL: single mailbox (legacy)
+    - ADMIN_EMAILS: comma-separated list (recommended)
+
+    NOTE: Frontend can also gate access, but backend remains the source of truth.
+    """
     user, err = require_user()
     if err:
         return None, err
 
     try:
         email = (user.get("email") or "").strip().lower()
-        if email != (ADMIN_EMAIL or "").strip().lower():
+        if not email:
+            return None, ("Admin access required", 403)
+        if email not in _admin_email_set():
             return None, ("Admin access required", 403)
         return user, None
     except Exception as e:
@@ -1817,11 +2004,25 @@ def course_state_delete():
 
     db = get_db()
 
+    # ✅ Remove ALL course-related data for this user + course.
+    # NOTE: Some caches (summaries/transcripts/mindmaps) are keyed by uid+video_url
+    # and can be shared across courses, so we do not wipe them here.
     db.course_states.delete_many({"uid": uid, "courseTitle": course_title})
     db.progress.delete_many({"uid": uid, "courseTitle": course_title})
     db.quiz_progress.delete_many({"uid": uid, "courseTitle": course_title})
     db.quizzes.delete_many({"uid": uid, "courseTitle": course_title})
     db.course_holds.delete_many({"uid": uid, "courseTitle": course_title})
+
+    # Unlock/quiz flags + attempt history
+    db.course_progress.delete_many({"uid": uid, "courseTitle": course_title})
+    db.quiz_attempts.delete_many({"uid": uid, "courseTitle": course_title})
+
+    # Course-scoped chat history + notes
+    db.chat_sessions.delete_many({"uid": uid, "courseTitle": course_title})
+    db.notes.delete_many({"uid": uid, "courseTitle": course_title})
+
+    # Completion mail tracker for this course
+    db.course_completion_mails.delete_many({"uid": uid, "courseTitle": course_title})
 
     return jsonify({"ok": True})
 @app.route("/courses/list", methods=["GET"])
@@ -2148,7 +2349,7 @@ def admin_delete_user():
             primary_cta={"label": "Contact support", "url": _safe_public_url("/contact")},
             secondary_cta={"label": "Open Zenith", "url": _safe_public_url("/")}
         )
-        _send_email(target_email, "Zenith Learning — Account removed", html, kind="admin")
+        _send_email(target_email, "Zenith Learning — Account removed", html, kind="mocktest")
     except Exception:
         pass
 
@@ -2213,7 +2414,7 @@ def admin_course_hold():
                 primary_cta={"label": "Open My Courses", "url": _safe_public_url("/my-courses")},
                 secondary_cta={"label": "Contact support", "url": _safe_public_url("/contact")},
             )
-            _send_email(to_email, f"Zenith Learning — Course {status}: {courseTitle}", html, kind="admin")
+            _send_email(to_email, f"Zenith Learning — Course {status}: {courseTitle}", html, kind="mocktest")
     except Exception:
         pass
 
@@ -2417,6 +2618,294 @@ def progress_get():
     return jsonify({"progressByVideo": doc.get("progressByVideo", {})})
 
 
+
+
+@app.route("/admin/mocktest-analytics", methods=["GET"])
+def admin_mocktest_analytics():
+    """Admin-only aggregate analytics for mock test sessions."""
+    _, err = require_admin()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+
+    try:
+        db = get_db()
+        col = _mocktest_sessions_col(db)
+        # Limit to last 2000 sessions to keep response fast
+        docs = list(col.find({}).sort("created_at", -1).limit(2000))
+
+        total_sessions = len(docs)
+        user_ids = set()
+        submitted = 0
+        passed = 0
+        total_score_sum = 0
+        total_marks_sum = 0
+
+        mode_counts = {}
+        day_counts = {}  # YYYY-MM-DD -> count
+
+        def _day_key(dt):
+            try:
+                if isinstance(dt, str):
+                    # keep prefix
+                    return dt[:10]
+                return (dt.date().isoformat())
+            except Exception:
+                return None
+
+        for d in docs:
+            uid = d.get("uid")
+            if uid:
+                user_ids.add(uid)
+
+            mode = (d.get("mode") or "all")
+            mode_counts[mode] = mode_counts.get(mode, 0) + 1
+
+            dk = _day_key(d.get("created_at") or d.get("createdAt"))
+            if dk:
+                day_counts[dk] = day_counts.get(dk, 0) + 1
+
+            ts = d.get("total_score")
+            tm = d.get("total_marks")
+            status = (d.get("status") or "").lower()
+
+            if ts is not None and tm is not None and int(tm or 0) > 0:
+                submitted += 1
+                try:
+                    ts_i = int(ts or 0)
+                    tm_i = int(tm or 0)
+                except Exception:
+                    ts_i, tm_i = 0, 0
+                total_score_sum += ts_i
+                total_marks_sum += tm_i
+                # Define pass as >= 60%
+                if tm_i > 0 and (ts_i / tm_i) >= 0.6:
+                    passed += 1
+            elif status in ("submitted", "completed"):
+                submitted += 1
+
+        avg_score_pct = round((total_score_sum / total_marks_sum) * 100, 2) if total_marks_sum else 0.0
+        pass_rate = round((passed / submitted) * 100, 2) if submitted else 0.0
+
+        # Recent 14 days timeline
+        today = datetime.now(timezone.utc).date()
+        timeline = []
+        for i in range(13, -1, -1):
+            day = (today - timedelta(days=i)).isoformat()
+            timeline.append({"day": day, "count": int(day_counts.get(day, 0))})
+
+        # Mode breakdown
+        mode_breakdown = [{"mode": k, "count": int(v)} for k, v in sorted(mode_counts.items(), key=lambda x: (-x[1], x[0]))]
+
+        return jsonify({
+            "ok": True,
+            "totalSessions": total_sessions,
+            "uniqueUsers": len(user_ids),
+            "submittedSessions": submitted,
+            "passedSessions": passed,
+            "avgScorePercent": avg_score_pct,
+            "passRate": pass_rate,
+            "modeBreakdown": mode_breakdown,
+            "timeline": timeline,
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/admin/mocktest-analytics/users", methods=["GET"])
+def admin_mocktest_analytics_users():
+    """Admin-only user-wise analytics for mock test sessions."""
+    _, err = require_admin()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+
+    try:
+        db = get_db()
+        col = _mocktest_sessions_col(db)
+        # Limit to last 5000 sessions for performance
+        docs = list(col.find({}).sort("created_at", -1).limit(5000))
+
+        users = {u.get("uid"): u for u in db.users.find({}, projection={"_id": 0, "uid": 1, "email": 1, "name": 1, "photoURL": 1, "photoLocalURL": 1})}
+
+        agg = {}
+        for d in docs:
+            uid = d.get("uid")
+            if not uid:
+                continue
+            a = agg.setdefault(uid, {
+                "uid": uid,
+                "sessions": 0,
+                "submitted": 0,
+                "passed": 0,
+                "scoreSum": 0,
+                "marksSum": 0,
+                "modeCounts": {},
+                "lastAttempt": None,
+            })
+            a["sessions"] += 1
+
+            mode = (d.get("mode") or "all")
+            a["modeCounts"][mode] = a["modeCounts"].get(mode, 0) + 1
+
+            created = d.get("created_at") or d.get("createdAt")
+            # keep most recent
+            try:
+                if a["lastAttempt"] is None:
+                    a["lastAttempt"] = created
+                else:
+                    # compare strings safely; ISO compares lexicographically
+                    if isinstance(created, str) and isinstance(a["lastAttempt"], str):
+                        if created > a["lastAttempt"]:
+                            a["lastAttempt"] = created
+            except Exception:
+                pass
+
+            ts = d.get("total_score")
+            tm = d.get("total_marks")
+            status = (d.get("status") or "").lower()
+            if ts is not None and tm is not None and int(tm or 0) > 0:
+                a["submitted"] += 1
+                try:
+                    ts_i = int(ts or 0)
+                    tm_i = int(tm or 0)
+                except Exception:
+                    ts_i, tm_i = 0, 0
+                a["scoreSum"] += ts_i
+                a["marksSum"] += tm_i
+                if tm_i > 0 and (ts_i / tm_i) >= 0.6:
+                    a["passed"] += 1
+            elif status in ("submitted", "completed"):
+                a["submitted"] += 1
+
+        rows = []
+        for uid, a in agg.items():
+            u = users.get(uid) or {}
+            email_lc = (u.get("email") or "").strip().lower()
+            # hide admin account
+            if email_lc == (ADMIN_EMAIL or "").strip().lower():
+                continue
+
+            avg_score_pct = round((a["scoreSum"] / a["marksSum"]) * 100, 2) if a["marksSum"] else 0.0
+            pass_rate = round((a["passed"] / a["submitted"]) * 100, 2) if a["submitted"] else 0.0
+            rows.append({
+                "uid": uid,
+                "name": u.get("name"),
+                "email": u.get("email"),
+                "photoURL": u.get("photoURL"),
+                "photoLocalURL": u.get("photoLocalURL"),
+                "sessions": int(a["sessions"]),
+                "submitted": int(a["submitted"]),
+                "passed": int(a["passed"]),
+                "avgScorePercent": avg_score_pct,
+                "passRate": pass_rate,
+                "modeBreakdown": [{"mode": k, "count": int(v)} for k, v in sorted(a["modeCounts"].items(), key=lambda x: (-x[1], x[0]))],
+                "lastAttempt": a.get("lastAttempt"),
+            })
+
+        rows.sort(key=lambda r: (r.get("passRate") or 0, r.get("avgScorePercent") or 0, r.get("sessions") or 0), reverse=True)
+        return jsonify({"ok": True, "rows": rows})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/admin/quiz-analytics/users", methods=["GET"])
+def admin_quiz_analytics_users():
+    """Admin-only user-wise analytics for quizzes (across all courses)."""
+    _, err = require_admin()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    try:
+        db = get_db()
+
+        # Map course -> total quizzes (videos count)
+        def count_videos(obj):
+            if obj is None:
+                return 0
+            if isinstance(obj, list):
+                return sum(count_videos(it) for it in obj)
+            if isinstance(obj, dict):
+                if isinstance(obj.get("videos"), list):
+                    return len(obj.get("videos"))
+                if "video" in obj and ("topic" in obj or "title" in obj):
+                    return 1
+                return sum(count_videos(v) for v in obj.values())
+            return 0
+
+        totals = {}
+        for st in db.course_states.find({}, projection={"_id": 0, "courseTitle": 1, "videos": 1}):
+            ct = st.get("courseTitle")
+            if not ct:
+                continue
+            totals[ct] = max(totals.get(ct, 0), count_videos(st.get("videos")))
+
+        users = {u.get("uid"): u for u in db.users.find({}, projection={"_id": 0, "uid": 1, "email": 1, "name": 1, "photoURL": 1, "photoLocalURL": 1})}
+
+        def count_true(dct):
+            if not isinstance(dct, dict):
+                return 0
+            return sum(1 for _, v in dct.items() if bool(v))
+
+        agg = {}
+        # For each user-course progress, sum totals/passed
+        for cp in db.course_progress.find({}, projection={"_id": 0, "uid": 1, "courseTitle": 1, "quizPassedMap": 1, "updatedAt": 1}):
+            uid = cp.get("uid")
+            ct = cp.get("courseTitle")
+            if not uid or not ct:
+                continue
+            total = int(totals.get(ct, 0))
+            passed = int(count_true(cp.get("quizPassedMap") or {}))
+            a = agg.setdefault(uid, {
+                "uid": uid,
+                "courses": 0,
+                "totalQuizzes": 0,
+                "passedQuizzes": 0,
+                "lastUpdated": None,
+            })
+            a["courses"] += 1
+            a["totalQuizzes"] += total
+            a["passedQuizzes"] += min(passed, total)
+            lu = cp.get("updatedAt")
+            try:
+                if a["lastUpdated"] is None:
+                    a["lastUpdated"] = lu
+                else:
+                    if isinstance(lu, str) and isinstance(a["lastUpdated"], str) and lu > a["lastUpdated"]:
+                        a["lastUpdated"] = lu
+            except Exception:
+                pass
+
+        rows = []
+        for uid, a in agg.items():
+            u = users.get(uid) or {}
+            email_lc = (u.get("email") or "").strip().lower()
+            if email_lc == (ADMIN_EMAIL or "").strip().lower():
+                continue
+
+            total = int(a.get("totalQuizzes") or 0)
+            passed = int(a.get("passedQuizzes") or 0)
+            avg_percent = round((passed / total) * 100, 2) if total else 0.0
+
+            rows.append({
+                "uid": uid,
+                "name": u.get("name"),
+                "email": u.get("email"),
+                "photoURL": u.get("photoURL"),
+                "photoLocalURL": u.get("photoLocalURL"),
+                "courses": int(a.get("courses") or 0),
+                "totalQuizzes": total,
+                "passedQuizzes": passed,
+                "avgPercent": avg_percent,
+                "lastUpdated": a.get("lastUpdated"),
+            })
+
+        rows.sort(key=lambda r: (r.get("avgPercent") or 0, r.get("passedQuizzes") or 0), reverse=True)
+        return jsonify({"ok": True, "rows": rows})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 @app.route("/progress/upsert", methods=["POST"])
 def progress_upsert():
     user, err = require_user()
@@ -2621,6 +3110,22 @@ def is_quota_error(e: Exception) -> bool:
     msg = str(e).lower()
     return ("429" in msg) or ("quota" in msg) or ("rate limit" in msg) or ("resource exhausted" in msg)
 
+
+class QuotaExceededError(Exception):
+    def __init__(self, message: str = 'Quota exceeded', retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _extract_retry_after_seconds(msg: str) -> float | None:
+    try:
+        m = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", msg, flags=re.I)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        return None
+    return None
+
 def _parse_iso8601_duration_to_seconds(iso: str) -> int:
     """
     Convert YouTube ISO 8601 duration (e.g., PT1H2M10S, PT45S) to seconds.
@@ -2664,7 +3169,13 @@ def _extract_topic_keywords(topic: str) -> set:
 
 def get_gemini_response(input_prompt: str) -> str:
     model = genai.GenerativeModel("gemini-2.5-flash")
-    response = model.generate_content(input_prompt)
+    try:
+        response = model.generate_content(input_prompt)
+    except Exception as e:
+        # Surface quota/rate errors with a consistent message so the UI can show it.
+        if is_quota_error(e):
+            raise RuntimeError("quota exceeded") from e
+        raise
 
     if not getattr(response, "candidates", None):
         raise ValueError("Gemini API returned no candidates.")
@@ -3085,6 +3596,11 @@ Transcript:
 
     except Exception as e:
         print("❌ GEMINI MINDMAP FAILED:", repr(e))
+        # If quota/rate-limit, surface to frontend (do not hide behind fallback mindmap)
+        if is_quota_error(e):
+            msg = str(e)
+            ra = _extract_retry_after_seconds(msg)
+            raise QuotaExceededError("Gemini quota exceeded. Please retry later or enable billing.", retry_after=ra)
         return build_fallback_mindmap(transcript, safe_title)
 
 
@@ -3468,6 +3984,12 @@ def get_transcript():
             return jsonify({"message": "Transcript is being processed", "job_id": transcript.job_id})
 
     except Exception as e:
+        if is_quota_error(e):
+            payload = {"error": "Transcript API quota exceeded. Please retry later or upgrade your plan.", "code": "quota_exceeded"}
+            ra = _extract_retry_after_seconds(str(e))
+            if ra is not None:
+                payload["retry_after"] = ra
+            return jsonify(payload), 429
         return jsonify({"error": str(e)}), 500
 
 # ---------------- QUIZ ----------------
@@ -3874,6 +4396,7 @@ def submit_quiz():
         full_quiz = quiz_doc.get("full_quiz", [])
 
         score = 0
+        t0 = time.time()
         results = []
         for i, q in enumerate(full_quiz):
             user_ans = answers[i] if i < len(answers) else ""
@@ -3897,6 +4420,65 @@ def submit_quiz():
         required = max(1, math.ceil(len(full_quiz) * PASS_PERCENT))
         passed = score >= required
 
+        # --- Persist per-video quiz attempt summary (used by Admin drilldowns) ---
+        # We store a compact doc keyed by (uid, courseTitle, videoNo) with bestScore + lastScore.
+        try:
+            video_url = (quiz_doc.get("video_url") or "").strip()
+
+            # prefer frontend-provided video number (avoids ordering mismatch)
+            req_video_no = data.get("video_no") or data.get("videoNo")
+            req_total_videos = data.get("total_videos") or data.get("totalVideos")
+            try:
+                req_video_no = int(req_video_no) if req_video_no is not None else None
+            except Exception:
+                req_video_no = None
+            try:
+                req_total_videos = int(req_total_videos) if req_total_videos is not None else None
+            except Exception:
+                req_total_videos = None
+
+            video_no, total_videos, video_title = derive_video_meta_from_course(
+                db=db,
+                uid=user.get("uid"),
+                course_title=courseTitle,
+                video_url=video_url,
+            )
+
+            if req_video_no:
+                video_no = req_video_no
+            if req_total_videos:
+                total_videos = req_total_videos
+
+            if courseTitle and video_no:
+                now_utc = datetime.now(timezone.utc)
+                db.quiz_attempts.update_one(
+                    {"uid": user.get("uid"), "courseTitle": courseTitle, "videoNo": int(video_no)},
+                    {
+                        "$setOnInsert": {
+                            "uid": user.get("uid"),
+                            "courseTitle": courseTitle,
+                            "videoNo": int(video_no),
+                            "totalVideos": int(total_videos) if total_videos else None,
+                            "video_url": video_url,
+                            "createdAt": now_utc,
+                        },
+                        "$set": {
+                            "quiz_id": quiz_id,
+                            "lastScore": int(score),
+                            "totalQuestions": int(len(full_quiz)),
+                            "required": int(required),
+                            "passed": bool(passed),
+                            "attemptsUsed": int(used),
+                            "updatedAt": now_utc,
+                            "lastAttemptAt": now_utc,
+                        },
+                        "$max": {"bestScore": int(score)},
+                    },
+                    upsert=True,
+                )
+        except Exception:
+            pass
+
         # ✅ SEND QUIZ RESULT EMAIL (VIDEO = COURSE VIDEO NUMBER like 4/32, not YouTube id)
         try:
             to_email = (user.get("email") or "").strip()
@@ -3904,31 +4486,23 @@ def submit_quiz():
                 status_line = "PASSED ✅" if passed else "NEEDS REATTEMPT ⚠️"
                 video_url = (quiz_doc.get("video_url") or "").strip()
 
-                # ✅ prefer frontend-provided video number (avoids off-by-one / ordering mismatches)
-                req_video_no = data.get("video_no") or data.get("videoNo")
-                req_total_videos = data.get("total_videos") or data.get("totalVideos")
+                # Derive video number (prefers the same logic we used above)
+                # (If persistence block failed, compute here as fallback)
                 try:
-                    req_video_no = int(req_video_no) if req_video_no is not None else None
+                    video_no = int(video_no) if "video_no" in locals() and video_no else None
                 except Exception:
-                    req_video_no = None
+                    video_no = None
                 try:
-                    req_total_videos = int(req_total_videos) if req_total_videos is not None else None
+                    total_videos = int(total_videos) if "total_videos" in locals() and total_videos else None
                 except Exception:
-                    req_total_videos = None
-
-                # ✅ derive video number (e.g., 4) and total (e.g., 32)
-                video_no, total_videos = derive_video_number_from_course(
-                    db=db,
-                    uid=user.get("uid"),
-                    course_title=courseTitle,
-                    video_url=video_url
-                )
-
-                # If frontend provided a video number/total, trust it
-                if req_video_no:
-                    video_no = req_video_no
-                if req_total_videos:
-                    total_videos = req_total_videos
+                    total_videos = None
+                if not video_no:
+                    video_no, total_videos, video_title = derive_video_meta_from_course(
+                        db=db,
+                        uid=user.get("uid"),
+                        course_title=courseTitle,
+                        video_url=video_url,
+                    )
 
                 # fallback
                 youtube_id = _yt_id(video_url)
@@ -4587,9 +5161,4637 @@ def pdf_delete():
             "pdf_store": getattr(r_store, "deleted_count", 0) or 0,
             "pdf_chat_sessions": getattr(r_sessions, "deleted_count", 0) or 0,
             "pdf_chats": deleted_pdf_chats,
+    }
+    })
+
+# ===================== RESUME-BASED MOCK INTERVIEW (InterviewSense-style) =====================
+# Collections:
+# - interview_sessions: per-user interview chat sessions with resume context
+# Notes:
+# - Uses existing Firebase auth (require_user) and Gemini (get_gemini_response)
+# - Stores resume text + chat history in MongoDB for persistence
+
+def _extract_pdf_text_bytes(pdf_bytes: bytes, max_chars: int = 250_000) -> str:
+    """Extract text from PDF bytes using PyPDF2; cap size to avoid huge prompts."""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        parts = []
+        for page in reader.pages:
+            try:
+                t = page.extract_text() or ""
+            except Exception:
+                t = ""
+            if t:
+                parts.append(t)
+            if sum(len(p) for p in parts) > max_chars:
+                break
+        text = "\n".join(parts).strip()
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
+
+def _is_docx_filename(name: str) -> bool:
+    name = (name or "").lower()
+    return name.endswith(".docx") or name.endswith(".docm")
+
+
+def _extract_docx_text_bytes(docx_bytes: bytes, max_chars: int = 250_000) -> str:
+    """Extract plain text from DOCX bytes using python-docx."""
+    try:
+        doc = Document(io.BytesIO(docx_bytes))
+        parts = []
+        for p in doc.paragraphs:
+            t = (p.text or "").strip()
+            if t:
+                parts.append(t)
+            if sum(len(x) for x in parts) > max_chars:
+                break
+        text = "\n".join(parts).strip()
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
+def _extract_resume_text(resume_file):
+    """Return (resume_text, kind, raw_bytes) where kind in {pdf, docx, unknown}."""
+    filename = getattr(resume_file, "filename", "") or ""
+    ctype = getattr(resume_file, "content_type", "") or ""
+    data = resume_file.read() or b""
+
+    kind = "unknown"
+    text = ""
+    if "pdf" in ctype or filename.lower().endswith(".pdf"):
+        kind = "pdf"
+        text = _extract_pdf_text_bytes(data)
+    elif "word" in ctype or _is_docx_filename(filename):
+        kind = "docx"
+        text = _extract_docx_text_bytes(data)
+    else:
+        text = _extract_pdf_text_bytes(data)
+        if text:
+            kind = "pdf"
+        else:
+            text = _extract_docx_text_bytes(data)
+            if text:
+                kind = "docx"
+    return (text or ""), kind, data
+
+
+def _normalize_keyword(k: str) -> str:
+    k = (k or "").strip().lower()
+    k = re.sub(r"[^a-z0-9\+\#\.\- ]+", " ", k)
+    k = re.sub(r"\s+", " ", k).strip()
+    return k
+
+
+def _filter_unwanted_keywords(keys):
+    """Remove noisy tokens: names, emails, phones, urls, pure numbers, etc."""
+    out = []
+    seen = set()
+    for k in (keys or []):
+        kk = _normalize_keyword(k)
+        if not kk:
+            continue
+        if len(kk) <= 2:
+            continue
+        if re.fullmatch(r"\d{3,}", kk):
+            continue
+        if "@" in kk or "http" in kk or "www" in kk:
+            continue
+        if re.search(r"\b(gmail|yahoo|outlook|linkedin|github)\b", kk):
+            continue
+        if kk in {"vinoth", "kumar", "t s", "ts"}:
+            continue
+        if kk in seen:
+            continue
+        seen.add(kk)
+        out.append(k.strip())
+    return out
+
+
+def _docx_replace_section(doc: Document, heading_patterns, new_paras, bullet: bool = False):
+    """Replace content after a heading until the next heading-like paragraph, preserving template."""
+    paras = doc.paragraphs
+    head_idx = None
+    for i, p in enumerate(paras):
+        t = (p.text or "").strip()
+        if not t:
+            continue
+        for hp in (heading_patterns or []):
+            if re.fullmatch(hp, t, flags=re.I) or re.search(hp, t, flags=re.I):
+                head_idx = i
+                break
+        if head_idx is not None:
+            break
+    if head_idx is None:
+        return False
+
+    def is_next_heading(text: str) -> bool:
+        tt = (text or "").strip()
+        if not tt:
+            return False
+        if len(tt) <= 40 and tt.upper() == tt and re.search(r"[A-Z]", tt):
+            return True
+        if re.fullmatch(r"(summary|objective|skills|experience|projects|education|certifications|achievements)", tt, flags=re.I):
+            return True
+        return False
+
+    start = head_idx + 1
+    end = start
+    while end < len(paras) and not is_next_heading(paras[end].text):
+        end += 1
+
+    base_style = None
+    for j in range(start, end):
+        if (paras[j].text or "").strip():
+            base_style = paras[j].style
+            break
+
+    for j in range(start, end):
+        paras[j].text = ""
+
+    lines = [ln.strip() for ln in (new_paras or []) if (ln or "").strip()]
+    if not lines:
+        return True
+
+    target = start
+    for ln in lines:
+        if target < end:
+            paras[target].text = ln
+            if base_style is not None:
+                try: paras[target].style = base_style
+                except Exception: pass
+            if bullet:
+                try: paras[target].style = "List Bullet"
+                except Exception: pass
+            target += 1
+        else:
+            newp = doc.add_paragraph(ln)
+            if base_style is not None:
+                try: newp.style = base_style
+                except Exception: pass
+            if bullet:
+                try: newp.style = "List Bullet"
+                except Exception: pass
+    return True
+
+
+def _pdf_bytes_to_docx_document(pdf_bytes: bytes):
+    """Best-effort PDF -> DOCX conversion using pdf2docx.
+    Returns a python-docx Document if conversion succeeds, else None.
+    NOTE: Only text-based PDFs convert well; scanned PDFs may lose layout.
+    """
+    if not pdf_bytes:
+        return None
+    try:
+        from pdf2docx import Converter  # type: ignore
+    except Exception:
+        return None
+
+    pdf_path = None
+    docx_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fpdf:
+            fpdf.write(pdf_bytes)
+            pdf_path = fpdf.name
+        docx_path = pdf_path + ".docx"
+
+        cv = Converter(pdf_path)
+        try:
+            cv.convert(docx_path, start=0, end=None)
+        finally:
+            try:
+                cv.close()
+            except Exception:
+                pass
+
+        with open(docx_path, "rb") as fdocx:
+            docx_bytes = fdocx.read()
+        return Document(io.BytesIO(docx_bytes))
+    except Exception:
+        return None
+    finally:
+        for p in (docx_path, pdf_path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+
+def _build_gemini_tailor_prompt(jd_struct: dict, resume_struct: dict, ats_struct: dict, jd_text: str, resume_text: str) -> str:
+    """Ask Gemini for ATS scoring + section-wise tailored rewrite (strict JSON).
+
+    NOTE: This function avoids Python f-string brace issues by building JSON schema via json.dumps.
+    """
+    schema = {
+        "ats_score": 0,
+        "reasoning_summary": "",
+        "missing_skills_priority": [],
+        "improvements": [],
+        "tailored_sections": {
+            "professional_summary": [],
+            "skills": [],
+            "experience_bullets": [],
+            "projects_bullets": [],
+            "education_lines": []
+        },
+        "tailored_diff": [
+            {
+                "section": "Professional Summary | Skills | Experience | Projects | Education",
+                "replace_instruction": "Tell the user which section to replace in the resume.",
+                "old_content": "",
+                "new_content": ""
+            }
+        ],
+        "missing_requirements": [
+            {"type": "education|work_experience|achievements|other", "requirement": "", "details": ""}
+        ]
+    }
+    schema_json = json.dumps(schema, ensure_ascii=False, indent=2)
+    parts = [
+        "You are an ATS evaluator and resume tailoring assistant.",
+        "",
+        "You will be given:",
+        "1) Parsed JD structure (skills/phrases)",
+        "2) Parsed Resume structure (skills, projects, experience, education, years estimate)",
+        "3) A preliminary ATS struct (matched/missing)",
+        "4) Raw JD text and Resume text (truncated)",
+        "",
+        "Your job:",
+        "A) Provide an ATS score 0-100 with a brief reasoning summary.",
+        "B) Provide 'missing_skills_priority' (top 10) and 'improvements' (bullet list).",
+        "C) Provide 'tailored_diff' as OLD → NEW rewrites so we can keep the user's original DOCX template.",
+        "D) Provide 'missing_requirements' for non-skill requirements (education/years/achievements) using semantic understanding (NOT word matching).",
+        "",
+        "STRICT RULES:",
+        "- Do NOT output names, phone numbers, emails, URLs as keywords.",
+        "- Only treat true technical/business skills and relevant domain terms as keywords.",
+        "- Do NOT hallucinate certifications, companies, or degrees not present in RESUME_STRUCT.",
+        "- If resume already satisfies a requirement, do NOT mark it missing.",
+        "",
+        "Respond as VALID JSON ONLY with this schema:",
+        schema_json,
+        "",
+        "JD_STRUCT:",
+        json.dumps(jd_struct, ensure_ascii=False)[:12000],
+        "",
+        "RESUME_STRUCT:",
+        json.dumps(resume_struct, ensure_ascii=False)[:12000],
+        "",
+        "ATS_STRUCT:",
+        json.dumps(ats_struct, ensure_ascii=False)[:12000],
+        "",
+        "JD_TEXT:",
+        (jd_text or "")[:12000],
+        "",
+        "RESUME_TEXT:",
+        (resume_text or "")[:20000],
+    ]
+    return "\n".join(parts).strip()
+def _interview_sessions_col(db):
+    return db["interview_sessions"]
+
+def _interview_session_public(doc):
+    if not doc:
+        return None
+    report = doc.get("report") if isinstance(doc.get("report"), dict) else None
+    overall = None
+    try:
+        overall = int(report.get("overall_score")) if report else None
+    except Exception:
+        overall = None
+    return {
+        "session_id": doc.get("session_id"),
+        "created_at": (doc.get("created_at") or datetime.utcnow()).isoformat(),
+        "updated_at": (doc.get("updated_at") or doc.get("created_at") or datetime.utcnow()).isoformat(),
+        "role_target": doc.get("role_target") or "",
+        "resume_uploaded": bool(doc.get("resume_text")),
+        "message_count": int(doc.get("message_count") or 0),
+        "resume_filename": doc.get("resume_filename") or "",
+        "jd_title": doc.get("jd_title") or "",
+        "jd_source": doc.get("jd_source") or "",
+        "has_report": bool(report),
+        "overall_score": overall,
+    }
+
+@app.post("/interview/session/start")
+def interview_start_session():
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+
+    uid = user.get("uid")
+    payload = request.get_json(silent=True) or {}
+    t0 = time.time()
+    role_target = (payload.get("role_target") or "").strip()
+
+    db = get_db()
+    col = _interview_sessions_col(db)
+
+    session_id = str(uuid.uuid4())
+    doc = {
+        "session_id": session_id,
+        "uid": uid,
+        "created_at": datetime.utcnow(),
+        "role_target": role_target,
+        "resume_filename": "",
+        "resume_text": "",
+        "chat_history": [],  # [{role:"candidate"|"hr", content:"...", ts:iso}]
+        "message_count": 0,
+        "updated_at": datetime.utcnow(),
+    }
+    col.insert_one(doc)
+    return jsonify({"ok": True, "session": _interview_session_public(doc)})
+
+@app.get("/interview/sessions")
+def interview_list_sessions():
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    db = get_db()
+    col = _interview_sessions_col(db)
+    items = list(col.find({"uid": uid}).sort("created_at", -1).limit(50))
+    return jsonify({"ok": True, "sessions": [_interview_session_public(d) for d in items]})
+
+@app.get("/interview/sessions/<session_id>/history")
+def interview_get_history(session_id):
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    db = get_db()
+    col = _interview_sessions_col(db)
+    doc = col.find_one({"uid": uid, "session_id": session_id})
+    if not doc:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify({
+        "ok": True,
+        "session": _interview_session_public(doc),
+        "chat_history": doc.get("chat_history", []),
+    })
+
+@app.post("/interview/sessions/<session_id>/reset")
+def interview_reset_session(session_id):
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    db = get_db()
+    col = _interview_sessions_col(db)
+    r = col.update_one(
+        {"uid": uid, "session_id": session_id},
+        {"$set": {"chat_history": [], "message_count": 0, "updated_at": datetime.utcnow()}}
+    )
+    if r.matched_count == 0:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify({"ok": True})
+
+@app.delete("/interview/sessions/<session_id>")
+def interview_delete_session(session_id):
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    db = get_db()
+    col = _interview_sessions_col(db)
+    r = col.delete_one({"uid": uid, "session_id": session_id})
+    if r.deleted_count == 0:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify({"ok": True})
+
+@app.post("/interview/resume/upload")
+def interview_upload_resume():
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+
+    # multipart/form-data: file + optional session_id + role_target
+    if "file" not in request.files:
+        return jsonify({"error": "Missing file"}), 400
+
+    file = request.files["file"]
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only PDF resumes are supported"}), 400
+
+    session_id = (request.form.get("session_id") or "").strip() or str(uuid.uuid4())
+    role_target = (request.form.get("role_target") or "").strip()
+
+    pdf_bytes = file.read() or b""
+    resume_text = _extract_pdf_text_bytes(pdf_bytes)
+    if not resume_text:
+        return jsonify({"error": "Could not extract text from this PDF. Try a text-based PDF (not scanned)."}), 400
+
+    db = get_db()
+    col = _interview_sessions_col(db)
+
+    now = datetime.utcnow()
+    doc = col.find_one({"uid": uid, "session_id": session_id})
+    if not doc:
+        # create session
+        doc = {
+            "session_id": session_id,
+            "uid": uid,
+            "created_at": now,
+            "role_target": role_target,
+            "resume_filename": filename,
+            "resume_text": resume_text,
+            "chat_history": [],
+            "message_count": 0,
+            "updated_at": now,
         }
+        col.insert_one(doc)
+    else:
+        # update session
+        update = {
+            "resume_filename": filename,
+            "resume_text": resume_text,
+            "updated_at": now,
+        }
+        if role_target:
+            update["role_target"] = role_target
+        col.update_one({"_id": doc["_id"]}, {"$set": update})
+        doc.update(update)
+
+    return jsonify({
+        "ok": True,
+        "message": "Resume uploaded and processed",
+        "session": _interview_session_public(doc),
+        "resume_chars": len(resume_text),
+    })
+
+# ---------------- MOCK INTERVIEW: JD + REPORT ----------------
+_INTERVIEW_PREDEFINED_ROLES = [
+    {"key": "custom", "title": "Custom Job Description"},
+    {"key": "business_analyst", "title": "Business Analyst"},
+    {"key": "product_manager", "title": "Product Manager"},
+    {"key": "software_engineer", "title": "Software Engineer"},
+    {"key": "marketing_specialist", "title": "Marketing Specialist"},
+    {"key": "data_analyst", "title": "Data Analyst"},
+    {"key": "customer_service_rep", "title": "Customer Service Representative"},
+    {"key": "sales_rep", "title": "Sales Representative"},
+    {"key": "hr_specialist", "title": "Human Resources Specialist"},
+    {"key": "ux_ui_designer", "title": "UX/UI Designer"},
+    {"key": "qa_engineer", "title": "QA Engineer"},
+]
+
+def _role_title_from_key(k: str) -> str:
+    k = (k or "").strip().lower()
+    for r in _INTERVIEW_PREDEFINED_ROLES:
+        if r["key"] == k:
+            return r["title"]
+    return ""
+
+def _generate_job_description(role_title: str) -> str:
+    role_title = (role_title or "").strip()
+    if not role_title:
+        return ""
+    prompt = f"""Create a detailed Job Description for the role: {role_title}.
+Include:
+- Job Title
+- Role Summary (2-4 sentences)
+- Responsibilities (8-12 bullet points)
+- Requirements (8-12 bullet points)
+- Nice-to-haves (4-6 bullet points)
+Keep it realistic and ATS-friendly. Limit to ~4500 characters."""
+    try:
+        return get_gemini_response(prompt)
+    except Exception:
+        return ""
+
+def _build_interview_prompt(resume_text: str, jd_text: str, role_target: str, chat_history: list, user_message: str) -> str:
+    resume_text = (resume_text or "")[:30_000]
+    jd_text = (jd_text or "")[:18_000]
+
+    turns = (chat_history or [])[-14:]
+    hist_lines = []
+    for t in turns:
+        r = (t.get("role") or "").lower()
+        c = (t.get("content") or "").strip()
+        if not c:
+            continue
+        label = "Candidate" if r == "candidate" else "HR"
+        hist_lines.append(f"{label}: {c}")
+    history_block = "\n".join(hist_lines).strip()
+    role_line = f"Target role: {role_target}\n" if role_target else ""
+
+    return f"""You are an expert HR + technical interviewer.
+Your job: conduct a realistic mock interview for the given Job Description (JD), using the candidate's resume.
+Rules:
+- Ask ONE strong question at a time.
+- Mix behavioral + technical + project deep-dives aligned to the JD.
+- If the answer is weak/unclear, ask a follow-up.
+- Keep responses concise (2-6 sentences). No long essays.
+- Do NOT invent resume details; only use what is present in the resume text.
+- If the candidate asks for feedback, give actionable feedback and a better sample answer.
+
+{role_line}
+JOB DESCRIPTION (excerpt):
+{jd_text}
+
+RESUME (excerpt):
+{resume_text}
+
+CHAT SO FAR:
+{history_block}
+
+Candidate's latest message:
+{user_message}
+
+Now respond as HR interviewer.
+""".strip()
+
+def _generate_first_question(resume_text: str, jd_text: str, role_target: str) -> str:
+    prompt = f"""You are an interviewer. Based on the Job Description and Resume below, ask the FIRST interview question.
+Rules:
+- Ask exactly ONE question.
+- Prefer a strong opening question referencing either a key JD responsibility or a resume project.
+- Keep it under 2 sentences.
+Target role (optional): {role_target}
+
+JOB DESCRIPTION:
+{(jd_text or '')[:12000]}
+
+RESUME:
+{(resume_text or '')[:20000]}
+"""
+    try:
+        out = get_gemini_response(prompt).strip()
+        out = re.sub(r"^\s*(\d+\.|[-*])\s*", "", out).strip()
+        return out or "Tell me about yourself and walk me through the most relevant parts of your resume for this role."
+    except Exception:
+        return "Tell me about yourself and walk me through the most relevant parts of your resume for this role."
+
+@app.get("/interview/jd/templates")
+def interview_jd_templates():
+    # Public list (no auth needed)
+    return jsonify({"ok": True, "roles": _INTERVIEW_PREDEFINED_ROLES})
+
+@app.post("/interview/session/create")
+def interview_create_session():
+    """Create a session with JD + Resume in one shot (multipart/form-data)."""
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+
+    # multipart: resume_file (required), jd_mode, role_key, jd_text OR jd_file, role_target
+    resume_file = request.files.get("resume_file")
+    if not resume_file:
+        return jsonify({"error": "resume_file is required (PDF)"}), 400
+    resume_filename = (resume_file.filename or "").strip()
+    if not resume_filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Resume must be a PDF"}), 400
+    resume_text = _extract_pdf_text_bytes(resume_file.read() or b"")
+    if not resume_text:
+        return jsonify({"error": "Could not extract text from resume PDF. Try a text-based PDF (not scanned)."}), 400
+
+    jd_mode = (request.form.get("jd_mode") or "predefined").strip().lower()  # predefined|custom
+    role_key = (request.form.get("role_key") or "").strip().lower()
+    role_target = (request.form.get("role_target") or "").strip()
+
+    jd_title = ""
+    jd_source = ""
+    jd_text = ""
+
+    if jd_mode == "custom":
+        jd_source = "custom"
+        jd_title = "Custom Job Description"
+        jd_text = (request.form.get("jd_text") or "").strip()
+        jd_file = request.files.get("jd_file")
+        if (not jd_text) and jd_file:
+            jd_text = _extract_pdf_text_bytes(jd_file.read() or b"")
+        if not jd_text:
+            return jsonify({"error": "Custom JD: provide jd_text or jd_file (PDF)"}), 400
+    else:
+        jd_source = "predefined"
+        jd_title = _role_title_from_key(role_key) or (role_target or "Job Description")
+        jd_text = (request.form.get("jd_text") or "").strip()
+        if not jd_text:
+            jd_text = _generate_job_description(jd_title)
+        if not jd_text:
+            return jsonify({"error": "Failed to generate JD. Please try again or use Custom JD."}), 400
+
+    # Create session
+    db = get_db()
+    col = _interview_sessions_col(db)
+    session_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+
+    first_q = _generate_first_question(resume_text, jd_text, role_target)
+
+    doc = {
+        "session_id": session_id,
+        "uid": uid,
+        "created_at": now,
+        "updated_at": now,
+        "role_target": role_target or jd_title,
+        "resume_filename": resume_filename,
+        "resume_text": resume_text,
+        "jd_title": jd_title,
+        "jd_source": jd_source,
+        "jd_text": jd_text,
+        "chat_history": [{"role": "hr", "content": first_q, "ts": now.isoformat()}],
+        "message_count": 1,
+        "report": None,
+        "report_generated_at": None,
+    }
+    col.insert_one(doc)
+
+    return jsonify({
+        "ok": True,
+        "session": _interview_session_public(doc),
+        "first_question": first_q,
+    })
+
+def _interview_report_prompt(resume_text: str, jd_text: str, chat_history: list) -> str:
+    # Keep prompt size controlled
+    resume_text = (resume_text or "")[:20_000]
+    jd_text = (jd_text or "")[:12_000]
+    turns = (chat_history or [])[-30:]
+    convo = []
+    for t in turns:
+        r = (t.get("role") or "").lower()
+        c = (t.get("content") or "").strip()
+        if not c:
+            continue
+        label = "Candidate" if r == "candidate" else "Interviewer"
+        convo.append(f"{label}: {c}")
+    convo_text = "\n".join(convo)
+
+    return f"""You are a strict interview evaluator.
+Given the Job Description, Resume, and Interview Transcript, produce a JSON report with:
+- overall_score (0-100 integer)
+- strengths (array of 4-7 bullets)
+- gaps (array of 4-7 bullets)
+- improvements (array of 6-10 actionable bullets)
+- category_scores: object with keys ["communication","technical","problem_solving","project_depth","role_fit"] each 0-100
+- summary (2-4 sentences)
+- next_steps (array of 3-5 bullets)
+
+Return ONLY valid JSON.
+
+JOB DESCRIPTION:
+{jd_text}
+
+RESUME:
+{resume_text}
+
+INTERVIEW TRANSCRIPT:
+{convo_text}
+""".strip()
+
+@app.get("/interview/sessions/<session_id>/report")
+def interview_get_report(session_id):
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+
+    db = get_db()
+    col = _interview_sessions_col(db)
+    doc = col.find_one({"uid": uid, "session_id": session_id})
+    if not doc:
+        return jsonify({"error": "Session not found"}), 404
+
+    # Generate if missing
+    if doc.get("report") and isinstance(doc.get("report"), dict):
+        return jsonify({"ok": True, "session": _interview_session_public(doc), "report": doc.get("report")})
+
+    if not doc.get("chat_history"):
+        return jsonify({"error": "No interview transcript found for this session"}), 400
+
+    try:
+        raw = get_gemini_response(_interview_report_prompt(doc.get("resume_text",""), doc.get("jd_text",""), doc.get("chat_history", [])))
+        # best-effort JSON parse
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(json)?", "", raw).strip()
+            raw = raw.strip("`").strip()
+        report = json.loads(raw)
+    except Exception as e:
+        return jsonify({"error": f"Failed to generate report: {e}"}), 500
+
+    now = datetime.utcnow()
+    col.update_one({"_id": doc["_id"]}, {"$set": {"report": report, "report_generated_at": now, "updated_at": now}})
+    doc["report"] = report
+    doc["report_generated_at"] = now
+    return jsonify({"ok": True, "session": _interview_session_public(doc), "report": report})
+
+# ---------------- ATS / RESUME TAILORING (AFFINDA + GEMINI) ----------------
+# Goal:
+# - deterministically parse resume/JD into structured signals (skills/projects/experience/education)
+# - compute a clean ATS score without "unwanted keywords" (names/emails/phones/etc.)
+# - ask Gemini to produce improvements + a tailored resume draft based on the parsed signals
+
+_STOPWORDS = set([
+    "the","and","for","with","from","this","that","to","of","in","on","a","an","as","is","are","was","were",
+    "be","by","or","at","it","we","you","your","our","their","they","he","she","them","his","her","will",
+    "can","may","should","must","have","has","had","do","does","did","not","but","if","then","than","into",
+    "about","over","under","within","across","using","use","used","also","etc","per","via"
+])
+
+_SECTION_ALIASES = {
+    "summary": ["summary","professional summary","objective","profile"],
+    "skills": ["skills","technical skills","skill set","toolbox","technologies"],
+    "experience": ["experience","work experience","professional experience","employment","internships","internship"],
+    "projects": ["projects","project","academic projects","personal projects"],
+    "education": ["education","academics","academic background","qualifications"],
+    "certifications": ["certifications","certificates","courses","training"],
+}
+
+# A lightweight lexicon of common ATS-relevant skills/tools.
+# (You can extend this list anytime; it is intentionally broad but curated.)
+_SKILL_LEXICON = [
+    # languages
+    "python","java","javascript","typescript","c","c++","c#","go","rust","kotlin","swift","sql","r","matlab","bash",
+    # web
+    "react","angular","vue","node.js","node","express","next.js","flask","django","spring","spring boot","rest","graphql",
+    "html","css","tailwind","bootstrap",
+    # data / ml
+    "pandas","numpy","scikit-learn","sklearn","tensorflow","pytorch","keras","xgboost","lightgbm",
+    "nlp","llm","generative ai","prompt engineering","rag","embeddings",
+    "data analysis","data analytics","statistics","hypothesis testing","a/b testing","experimentation",
+    "power bi","tableau","excel","spreadsheets","spss","sas",
+    # cloud / devops
+    "aws","gcp","azure","docker","kubernetes","git","github","ci/cd","linux",
+    # db
+    "mysql","postgresql","postgres","mongodb","firebase","redis","sqlite","oracle",
+    # testing / qa
+    "unit testing","integration testing","jest","pytest","selenium",
+    # mobile
+    "flutter","dart","android","ios",
+    # misc
+    "microservices","system design","oauth","jwt","api","agile","scrum"
+]
+
+# normalize lexicon (map token -> canonical label)
+def _canon_skill(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("nodejs", "node.js")
+    s = s.replace("sklearn", "scikit-learn")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+_SKILL_CANON = {_canon_skill(x): x for x in _SKILL_LEXICON}
+
+_EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", re.I)
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
+_PHONE_RE = re.compile(r"(\+?\d[\d\s\-()]{7,}\d)")
+
+# ---------------- ATS (AFFINDA + GEMINI) HELPERS ----------------
+# We use Affinda (if configured) for high-quality structured extraction,
+# then Gemini for resume-specific improvements + section rewrites (Option 1: only weak/missing sections).
+
+def _affinda_config():
+    return {
+        "api_key": os.environ.get("AFFINDA_API_KEY", "").strip(),
+        "workspace": os.environ.get("AFFINDA_WORKSPACE", "").strip(),
+        "doctype_resume": os.environ.get("AFFINDA_DOCTYPE_RESUME", "").strip(),
+        "base_url": (os.environ.get("AFFINDA_BASE_URL", "https://api.affinda.com").strip().rstrip("/")),
+    }
+
+def _affinda_parse_resume(file_bytes: bytes, filename: str = "resume.pdf") -> dict:
+    """Call Affinda Resume Parser (best-effort). Returns dict with keys: ok, skills(list[str]), raw(json)."""
+    cfg = _affinda_config()
+    if not cfg["api_key"]:
+        return {"ok": False, "error": "AFFINDA_API_KEY not set"}
+    try:
+        url = f"{cfg['base_url']}/v2/resumes"
+        files = {"file": (filename or "resume.pdf", file_bytes)}
+        data = {}
+        if cfg["workspace"]:
+            data["workspace"] = cfg["workspace"]
+        if cfg["doctype_resume"]:
+            data["document_type"] = cfg["doctype_resume"]
+
+        # Affinda commonly accepts either Bearer or Token auth; try Bearer first, then Token.
+        headers_list = [
+            {"Authorization": f"Bearer {cfg['api_key']}"},
+            {"Authorization": f"Token {cfg['api_key']}"},
+        ]
+
+        last = None
+        for headers in headers_list:
+            try:
+                resp = requests.post(url, headers=headers, files=files, data=data, timeout=45)
+                last = resp
+                if resp.status_code in (401, 403):
+                    continue
+                if resp.status_code >= 400:
+                    break
+                j = resp.json()
+                skills = []
+                try:
+                    data_obj = j.get("data") or {}
+                    raw_sk = data_obj.get("skills") or []
+                    for s in raw_sk:
+                        if isinstance(s, str):
+                            skills.append(s)
+                        elif isinstance(s, dict):
+                            nm = s.get("name") or s.get("skill") or s.get("value")
+                            if nm:
+                                skills.append(str(nm))
+                    skills = sorted({str(x).strip() for x in skills if str(x).strip()}, key=lambda x: x.lower())
+                except Exception:
+                    skills = []
+                return {"ok": True, "skills": skills, "raw": j}
+            except Exception as e:
+                last = e
+                continue
+        if hasattr(last, "text"):
+            return {"ok": False, "error": f"Affinda error: HTTP {getattr(last,'status_code', '?')} {last.text[:300]}"}
+        return {"ok": False, "error": f"Affinda error: {last}"}
+    except Exception as e:
+        return {"ok": False, "error": f"Affinda exception: {e}"}
+
+def _merge_resume_struct_with_affinda(resume_struct: dict, aff: dict) -> dict:
+    if not isinstance(resume_struct, dict):
+        resume_struct = {}
+    if isinstance(aff, dict) and aff.get("ok") and isinstance(aff.get("skills"), list):
+        merged = set(resume_struct.get("skills") or [])
+        for s in aff.get("skills") or []:
+            ss = str(s).strip()
+            if ss:
+                merged.add(ss)
+        resume_struct["skills"] = sorted(merged, key=lambda x: x.lower())
+        resume_struct["affinda_used"] = True
+    else:
+        resume_struct["affinda_used"] = False
+    return resume_struct
+
+def _pick_weak_sections(resume_sections: dict, ats_struct: dict, missing_requirements: list) -> list:
+    """Option 1: only weak/missing sections. Returns list of section keys: skills, experience, projects, education."""
+    resume_sections = resume_sections or {}
+    missing_skills = (ats_struct or {}).get("missing_skills") or []
+    out = []
+
+    if missing_skills:
+        out.append("skills")
+
+    if (resume_sections.get("experience") or "").strip():
+        out.append("experience")
+    elif (resume_sections.get("projects") or "").strip():
+        out.append("projects")
+
+    try:
+        for r in (missing_requirements or []):
+            typ = (r.get("type") or "").lower() if isinstance(r, dict) else ""
+            if "education" in typ and (resume_sections.get("education") or "").strip():
+                out.append("education")
+                break
+    except Exception:
+        pass
+
+    uniq = []
+    for k in out:
+        if k not in uniq and (resume_sections.get(k) or "").strip():
+            uniq.append(k)
+    return uniq[:3]
+
+def _gemini_ats_section_rewrites(jd_text: str, resume_sections: dict, missing_skills_priority: list, weak_sections: list) -> dict:
+    """Ask Gemini to produce resume-specific improvements + OLD->NEW rewrites for weak sections only.
+
+    Option 1: Only rewrite the weak sections detected by our analyzer.
+    """
+    sec_payload = {}
+    for k in (weak_sections or []):
+        sec_payload[k] = (resume_sections.get(k) or "")[:6000]
+
+    # Give Gemini a strict schema to reduce empty / generic output.
+    schema = {
+        "improvements": [
+            "Example: Projects section: add REST API + MongoDB keywords where relevant; your current bullets mention Flask but not API design."
+        ],
+        "tailored_diff": [
+            {
+                "section": "skills|experience|projects|education",
+                "replace_instruction": "Tell the user which section to replace.",
+                "old_content": "Exact old section text from RESUME_SECTIONS.",
+                "new_content": "Rewritten ATS-friendly content (copy/paste)."
+            }
+        ]
+    }
+    schema_json = json.dumps(schema, ensure_ascii=False, indent=2)
+
+    # IMPORTANT: keep this prompt deterministic & grounded in provided text
+    prompt = "\n".join([
+        "You are an ATS resume optimizer. Your output MUST be grounded in the provided resume text.",
+        "",
+        "INPUTS:",
+        "1) JOB DESCRIPTION (JD)",
+        "2) RESUME_SECTIONS (ONLY weak sections; exact text)",
+        "3) MISSING_SKILLS_PRIORITY (top missing JD keywords)",
+        "",
+        "STRICT RULES:",
+        "- Output VALID JSON ONLY. No markdown, no extra text.",
+        "- Do NOT invent companies, degrees, certifications, job titles, years, metrics or achievements not present.",
+        "- You MAY add missing keywords ONLY as 'familiarity' / 'worked with' style language, unless the resume already shows usage.",
+        "- Preserve the user's tone and structure (bullets/lines).",
+        "- NEW content must be meaningfully different from OLD (not copy-paste).",
+        "",
+        "TASK A (Improvements):",
+        "- Provide 8–12 resume-specific improvements.",
+        "- Each improvement MUST include a section name (Skills/Experience/Projects/Education) and mention at least one missing keyword from MISSING_SKILLS_PRIORITY.",
+        "- Each improvement MUST reference what is currently written (quote a short phrase from OLD content if possible).",
+        "",
+        "TASK B (Tailored rewrites):",
+        "- For EACH weak section in RESUME_SECTIONS, return an OLD→NEW rewrite the user can copy-paste.",
+        "- Naturally incorporate up to 3–6 of the most relevant missing keywords for that section.",
+        "- If a section is empty, generate a compact ATS-friendly version consistent with the resume context.",
+        "",
+        "Respond as JSON with EXACT schema:",
+        schema_json,
+        "",
+        "JD:",
+        (jd_text or "")[:14000],
+        "",
+        "MISSING_SKILLS_PRIORITY:",
+        json.dumps((missing_skills_priority or [])[:22], ensure_ascii=False),
+        "",
+        "RESUME_SECTIONS:",
+        json.dumps(sec_payload, ensure_ascii=False),
+    ])
+
+    return _gemini_json(prompt) or {}
+def _clean_text_basic(text: str) -> str:
+    t = (text or "")
+    t = _EMAIL_RE.sub(" ", t)
+    t = _URL_RE.sub(" ", t)
+    t = _PHONE_RE.sub(" ", t)
+    t = t.replace("\x00", " ")
+    return t
+
+def _tokenize(text: str) -> list:
+    t = re.sub(r"[^a-z0-9\+\#\.\s]", " ", (text or "").lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return []
+    return t.split()
+
+def _extract_skill_mentions(text: str) -> list:
+    """
+    Return a de-duplicated list of skills (canonicalized) found in the text.
+    Matches:
+      - exact lexicon phrases (including multi-word)
+      - common variants (node, node.js, scikit-learn/sklearn)
+    """
+    t = _clean_text_basic(text).lower()
+    # phrase match for multi-word skills
+    found = set()
+    for canon, pretty in _SKILL_CANON.items():
+        if " " in canon:
+            if canon in t:
+                found.add(pretty)
+    # token-level match for single words (and short tokens like c++)
+    toks = set(_tokenize(t))
+    for canon, pretty in _SKILL_CANON.items():
+        if " " in canon:
+            continue
+        if canon in toks:
+            found.add(pretty)
+    # also map "node" -> node.js if present
+    if "node" in toks and ("node.js" in _SKILL_CANON):
+        found.add(_SKILL_CANON["node.js"])
+    # consistent ordering
+    return sorted(found, key=lambda x: x.lower())
+
+def _split_into_sections(text: str) -> dict:
+    """Best-effort section split based on common resume/JD headings."""
+    raw = _clean_text_basic(text)
+    lines = [ln.rstrip() for ln in raw.splitlines()]
+
+    heading_to_key = {}
+    for key, aliases in _SECTION_ALIASES.items():
+        for a in aliases:
+            heading_to_key[a.lower()] = key
+
+    sections = {}
+    cur_key = "other"
+    buf = []
+
+    def flush():
+        nonlocal buf, cur_key
+        s = "\n".join(buf).strip()
+        if s:
+            sections[cur_key] = (sections.get(cur_key, "") + "\n" + s).strip()
+        buf = []
+
+    for ln in lines:
+        norm = re.sub(r"[^a-z0-9\s]", "", ln.lower()).strip()
+        if 1 <= len(norm) <= 35 and norm in heading_to_key:
+            flush()
+            cur_key = heading_to_key[norm]
+            continue
+        if ln.strip() and ln.strip().isupper():
+            norm2 = re.sub(r"[^a-z0-9\s]", "", ln.lower()).strip()
+            if norm2 in heading_to_key:
+                flush()
+                cur_key = heading_to_key[norm2]
+                continue
+        buf.append(ln)
+    flush()
+    return sections
+
+def _estimate_experience_years(exp_text: str) -> float:
+    """Estimate experience duration from year ranges in Experience section."""
+    t = _clean_text_basic(exp_text)
+    years = [int(y) for y in re.findall(r"\b(19\d{2}|20\d{2})\b", t)]
+    years = [y for y in years if 1980 <= y <= datetime.utcnow().year + 1]
+    years = sorted(set(years))
+    if len(years) >= 2:
+        return max(0.0, float(max(years) - min(years)))
+    intern_mentions = len(re.findall(r"\bintern\b|\binternship\b", t, re.I))
+    if intern_mentions:
+        return 0.5 * intern_mentions
+    return 0.0
+
+def _extract_education_lines(edu_text: str) -> list:
+    out = []
+    for ln in (edu_text or "").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if re.search(r"\b(b\.?e|b\.?tech|bachelor|m\.?s|m\.?tech|master|ph\.?d|university|college)\b", s, re.I):
+            out.append(s)
+    return out[:12]
+
+def _extract_project_summaries(proj_text: str) -> list:
+    """Split projects into chunks and attach detected tech stack."""
+    t = (proj_text or "").strip()
+    if not t:
+        return []
+    chunks = re.split(r"\n\s*\n+", t)
+    out = []
+    for ch in chunks:
+        s = ch.strip()
+        if not s:
+            continue
+        skills = _extract_skill_mentions(s)
+        first_line = s.splitlines()[0].strip()
+        title = first_line[:120]
+        out.append({"title": title, "skills": skills[:12], "snippet": s[:600]})
+        if len(out) >= 6:
+            break
+    return out
+
+def _parse_resume_structured(resume_text: str) -> dict:
+    sections = _split_into_sections(resume_text)
+    skills = set(_extract_skill_mentions(sections.get("skills","") + "\n" + resume_text))
+    edu_lines = _extract_education_lines(sections.get("education",""))
+    projects = _extract_project_summaries(sections.get("projects",""))
+    exp_years = _estimate_experience_years(sections.get("experience",""))
+    return {
+        "skills": sorted(skills, key=lambda x: x.lower()),
+        "experience_years_est": round(exp_years, 2),
+        "education_lines": edu_lines,
+        "projects": projects,
+        "sections_present": sorted([k for k,v in sections.items() if (v or "").strip()]),
+    }
+
+def _parse_jd_structured(jd_text: str) -> dict:
+    skills = set(_extract_skill_mentions(jd_text))
+    t = _clean_text_basic(jd_text).lower()
+    phrases = set()
+    for m in re.finditer(r"\b([a-z][a-z0-9]+(?:\s+[a-z][a-z0-9]+){1,2})\b", t):
+        ph = m.group(1).strip()
+        if any(w in _STOPWORDS for w in ph.split()):
+            continue
+        if len(ph) < 6 or len(ph) > 35:
+            continue
+        if _EMAIL_RE.search(ph) or _URL_RE.search(ph) or _PHONE_RE.search(ph):
+            continue
+        if re.search(r"\b(analysis|analytics|testing|engineering|reporting|visualization|database|cloud|api|automation|ml|ai|data)\b", ph):
+            phrases.add(ph)
+    return {
+        "skills": sorted(skills, key=lambda x: x.lower()),
+        "skill_phrases": sorted(list(phrases))[:60],
+    }
+
+def _extract_jd_requirements(jd_text: str) -> dict:
+    """Best-effort extraction of non-skill requirements from a JD."""
+    t = _clean_text_basic(jd_text or "")
+    low = t.lower()
+
+    # Education requirements
+    edu = set()
+    edu_patterns = [
+        r"\b(bachelor(?:'s)?|b\.?\s*e\.?|b\.?\s*tech|btech|b\.\s*sc|bsc)\b",
+        r"\b(master(?:'s)?|m\.?\s*e\.?|m\.?\s*tech|mtech|m\.\s*sc|msc|mba)\b",
+        r"\b(ph\.?d|doctorate)\b",
+        r"\b(computer science|information technology|electronics|electrical|statistics|mathematics|data science)\b",
+    ]
+    for pat in edu_patterns:
+        for m in re.finditer(pat, low, flags=re.IGNORECASE):
+            edu.add(m.group(0).strip())
+
+    # Experience requirement (years)
+    years_min = None
+    for m in re.finditer(r"\b(\d{1,2})\s*\+?\s*(?:years|yrs)\b", low):
+        try:
+            y = int(m.group(1))
+            years_min = y if years_min is None else min(years_min, y)
+        except Exception:
+            pass
+
+    # Certifications / achievements signals
+    certs = set()
+    for m in re.finditer(r"\b(aws|azure|gcp)\s+(certified|certification)\b", low):
+        certs.add(m.group(0).strip())
+    for m in re.finditer(r"\b(certification|certified)\b[^\n\.]{0,60}", low):
+        frag = m.group(0).strip()
+        if len(frag) >= 10:
+            certs.add(frag)
+
+    achievements = set()
+    ach_patterns = [
+        r"\b(award|awarded|recognition|accomplishment|achievement)\b",
+        r"\b(publication|published|patent)\b",
+        r"\b(hackathon|winner|winning)\b",
+        r"\b(leadership|led|mentored|managed)\b",
+    ]
+    for pat in ach_patterns:
+        if re.search(pat, low):
+            achievements.add(re.search(pat, low).group(0))
+
+    # Responsibilities (non-skill) - keep short: ownership, collaboration, communication
+    non_skill = set()
+    for m in re.finditer(r"\b(communication|collaboration|stakeholder|ownership|leadership|mentoring)\b", low):
+        non_skill.add(m.group(0))
+
+    return {
+        "education_tokens": sorted(edu),
+        "min_years_experience": years_min,
+        "certification_hints": sorted(certs)[:15],
+        "achievement_hints": sorted(achievements),
+        "non_skill_requirements": sorted(non_skill),
+    }
+
+
+def _compute_missing_requirements(jd_req: dict, resume_struct: dict) -> list:
+    """Compare extracted JD requirements against parsed resume struct."""
+    out = []
+
+    # Education: if JD clearly asks for a degree/field and resume has no education lines
+    edu_lines = resume_struct.get("education_lines") or []
+    if jd_req.get("education_tokens") and not edu_lines:
+        out.append({
+            "type": "education",
+            "requirement": "Education details mentioned in JD, but resume has no Education section detected.",
+            "details": jd_req.get("education_tokens")[:10],
+        })
+
+    # Experience: compare min years
+    min_years = jd_req.get("min_years_experience")
+    try:
+        resume_years = float(resume_struct.get("experience_years_est") or 0)
+    except Exception:
+        resume_years = 0.0
+    if isinstance(min_years, int) and min_years > 0 and resume_years + 0.49 < float(min_years):
+        out.append({
+            "type": "work_experience",
+            "requirement": f"JD mentions ~{min_years}+ years experience.",
+            "details": {"resume_years_est": round(resume_years, 2), "jd_min_years": min_years},
+        })
+
+    # Certifications: if JD hints certifications and resume doesn't have certifications section
+    sections_present = set((resume_struct.get("sections_present") or []))
+    has_certs = ("certifications" in sections_present)
+    if jd_req.get("certification_hints") and not has_certs:
+        out.append({
+            "type": "certifications",
+            "requirement": "JD references certifications; resume has no Certifications section detected.",
+            "details": jd_req.get("certification_hints")[:10],
+        })
+
+    # Achievements: heuristic - JD hints achievements and resume doesn't contain achievement-like words
+    if jd_req.get("achievement_hints"):
+        raw = " ".join([str(x) for x in edu_lines]) + " " + " ".join([str(x) for x in (resume_struct.get("projects") or [])])
+        low = raw.lower()
+        if not re.search(r"\b(award|awarded|winner|publication|patent|achievement|accomplishment)\b", low):
+            out.append({
+                "type": "achievements",
+                "requirement": "JD implies measurable achievements/recognitions; resume doesn't clearly highlight them.",
+                "details": jd_req.get("achievement_hints")[:10],
+            })
+    return out
+
+def _compute_ats_score_structured(jd: dict, resume: dict) -> dict:
+    jd_skills = set([_canon_skill(x) for x in (jd.get("skills") or [])])
+    res_skills = set([_canon_skill(x) for x in (resume.get("skills") or [])])
+
+    matched = sorted({s for s in jd_skills if s in res_skills})
+    missing = sorted({s for s in jd_skills if s not in res_skills})
+
+    coverage = (len(matched) / max(1, len(jd_skills))) if jd_skills else 0.0
+
+    skills_score = round(60.0 * min(1.0, coverage), 1)
+
+    exp_years = float(resume.get("experience_years_est") or 0.0)
+    exp_score = 0.0
+    if exp_years >= 3:
+        exp_score = 20.0
+    elif exp_years >= 2:
+        exp_score = 14.0
+    elif exp_years >= 1:
+        exp_score = 8.0
+
+    proj_count = len(resume.get("projects") or [])
+    proj_score = min(10.0, 3.0 * proj_count)
+    edu_score = 10.0 if (resume.get("education_lines") or []) else 5.0
+
+    total = skills_score + exp_score + proj_score + edu_score
+    score = int(round(min(100.0, total)))
+
+    return {
+        "score": score,
+        "coverage": round(coverage * 100, 1),
+        "matched_skills": matched[:40],
+        "missing_skills": missing[:40],
+        "score_breakdown": {
+            "skills": skills_score,
+            "experience": exp_score,
+            "projects": round(proj_score, 1),
+            "education": round(edu_score, 1),
+        }
+    }
+
+
+def _compute_ats_analytics(jd_text: str, jd_struct: dict, resume_struct: dict, ats_struct: dict) -> dict:
+    """Return lightweight analytics (no radar):
+    - donut inputs (matched vs missing)
+    - category breakdown (JD vs resume match %)
+    - weighted missing skills based on JD frequency
+    """
+    jd_text_l = _clean_text_basic(jd_text or "").lower()
+
+    jd_skills = [(_canon_skill(x) or "") for x in (jd_struct.get("skills") or [])]
+    res_skills = set([_canon_skill(x) for x in (resume_struct.get("skills") or [])])
+
+    # Category rules are intentionally simple & transparent.
+    buckets = {
+        "Programming": ["python","java","javascript","typescript","c","c++","c#","go","rust","kotlin","swift","sql","r","matlab","bash"],
+        "Web": ["react","angular","vue","node.js","node","express","next.js","flask","django","spring","spring boot","rest","graphql","html","css","tailwind","bootstrap"],
+        "Data/ML": ["pandas","numpy","scikit-learn","tensorflow","pytorch","keras","xgboost","lightgbm","nlp","llm","generative ai","rag","embeddings","data analysis","data analytics","statistics","hypothesis testing","a/b testing","experimentation","power bi","tableau","excel"],
+        "Cloud/DevOps": ["aws","gcp","azure","docker","kubernetes","git","github","ci/cd","linux","microservices","system design","oauth","jwt"],
+        "Databases": ["mysql","postgresql","postgres","mongodb","firebase","redis","sqlite","oracle"],
+        "Testing/QA": ["unit testing","integration testing","jest","pytest","selenium"],
+        "Mobile": ["flutter","dart","android","ios"],
+    }
+
+    inv = {}
+    for cat, lst in buckets.items():
+        for s in lst:
+            inv[_canon_skill(s)] = cat
+
+    total = {k: 0 for k in buckets.keys()}
+    matched = {k: 0 for k in buckets.keys()}
+
+    for s in jd_skills:
+        cat = inv.get(s)
+        if not cat:
+            continue
+        total[cat] += 1
+        if s in res_skills:
+            matched[cat] += 1
+
+    category_breakdown = []
+    for cat in buckets.keys():
+        if total[cat] <= 0:
+            continue
+        mp = round(100.0 * (matched[cat] / max(1, total[cat])), 1)
+        category_breakdown.append({
+            "category": cat,
+            "jd_count": int(total[cat]),
+            "matched_count": int(matched[cat]),
+            "missing_count": int(max(0, total[cat] - matched[cat])),
+            "match_pct": mp,
+        })
+
+    # Weighted missing skills (based on occurrences in JD)
+    missing_skills = (ats_struct.get("missing_skills") or [])
+    weights = []
+    for sk in missing_skills:
+        canon = _canon_skill(sk)
+        if not canon:
+            continue
+        if " " in canon or "." in canon or "+" in canon or "#" in canon:
+            w = jd_text_l.count(canon)
+        else:
+            w = len(re.findall(r"\b" + re.escape(canon) + r"\b", jd_text_l))
+        if w <= 0:
+            w = 1
+        weights.append({"skill": sk, "weight": int(w)})
+    weights.sort(key=lambda x: (-x["weight"], x["skill"].lower()))
+
+    matched_n = len(ats_struct.get("matched_skills") or [])
+    missing_n = len(missing_skills)
+    denom = max(1, matched_n + missing_n)
+    match_pct = round(100.0 * (matched_n / denom), 1)
+
+    return {
+        "match_pct": match_pct,
+        "matched_count": matched_n,
+        "missing_count": missing_n,
+        "category_breakdown": category_breakdown,
+        "top_missing_weighted": weights[:12],
+    }
+
+
+def _gemini_json(prompt: str) -> dict:
+    """Call Gemini and coerce its output into a JSON object (best-effort).
+
+    Gemini sometimes returns markdown fences or extra commentary; we try hard to recover JSON.
+    """
+    try:
+        raw = (get_gemini_response(prompt) or "").strip()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+
+    # Strip markdown fences if present
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(json)?", "", raw, flags=re.I).strip()
+        raw = raw.strip("`").strip()
+
+    # First attempt: direct JSON parse
+    try:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            raw_obj = raw[start:end+1]
+            return json.loads(raw_obj)
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    # Second attempt: regex-extract first JSON object
+    try:
+        obj = _extract_json_obj(raw)
+        return obj or {}
+    except Exception:
+        return {}
+
+
+def _extract_json_obj(text: str):
+    """Extract the first JSON object from Gemini output (best-effort)."""
+    if not text:
+        return None
+    raw = str(text).strip()
+    # Strip markdown fences if present
+    raw = re.sub(r"```(?:json)?", "", raw, flags=re.I).replace("```", "").strip()
+    m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _gemini_code_analysis(problem_text: str, source_code: str, language: str) -> dict:
+    """Return {timeComplexity, spaceComplexity, reason} using Gemini (best-effort)."""
+    try:
+        pt = (problem_text or "").strip()
+        sc = (source_code or "").strip()
+        if not sc:
+            return {}
+        prompt = f"""You are a code reviewer.
+
+Given:
+- Problem statement (may be partial): {pt[:4000]}
+- Language: {language}
+- Candidate solution code:
+{sc[:12000]}
+
+Task:
+Estimate the asymptotic time and space complexity in Big-O and give a SHORT reason (1-2 lines).
+
+Return STRICT JSON only:
+{{
+  "timeComplexity": "O(...)",
+  "spaceComplexity": "O(...)",
+  "reason": "short reasoning"
+}}
+"""
+        obj = _gemini_json(prompt) or {}
+        out = {
+            "timeComplexity": (obj.get("timeComplexity") or obj.get("time_complexity") or "").strip(),
+            "spaceComplexity": (obj.get("spaceComplexity") or obj.get("space_complexity") or "").strip(),
+            "reason": (obj.get("reason") or obj.get("explanation") or "").strip(),
+        }
+        return {k: v for k, v in out.items() if v}
+    except Exception:
+        return {}
+
+
+def _resume_sections_for_gemini(resume_text: str) -> dict:
+    """Return section texts for Gemini semantic comparison."""
+    sections = _split_into_sections(resume_text or "")
+    # Normalize keys we care about
+    return {
+        "education_text": (sections.get("education") or "").strip(),
+        "experience_text": (sections.get("experience") or "").strip(),
+        "achievements_text": (sections.get("achievements") or "").strip(),
+        "certifications_text": (sections.get("certifications") or "").strip(),
+        "projects_text": (sections.get("projects") or "").strip(),
+        "skills_text": (sections.get("skills") or "").strip(),
+        "full_text": (resume_text or "").strip()[:20000],
+    }
+
+
+def _gemini_requirements_and_improvements(jd_text: str, resume_sections: dict) -> dict:
+    """Use Gemini to semantically compare JD non-skill requirements vs resume sections.
+
+    Returns:
+      {
+        "missing_requirements": [ {type, requirement, status, evidence_resume, evidence_jd, fix_suggestion}, ... ],
+        "improvements": [ "..." ]
+      }
+    """
+    prompt = f"""You are an ATS evaluator.
+
+Goal:
+1) Extract non-skill requirements from the Job Description (JD)
+2) Compare them with the resume sections SEMANTICALLY (not keyword match)
+3) Return missing requirements and actionable improvements
+
+IMPORTANT RULES:
+- Do NOT do keyword-only matching.
+- Consider equivalent formats: "B.Tech" == "Bachelor of Technology", "BE" == "B.E."
+- If resume has the requirement but in a different format, mark as PRESENT.
+- If something is unclear, mark it as "uncertain" with a note.
+
+Return STRICT JSON ONLY. No markdown.
+
+JSON schema:
+{{
+  "missing_requirements": [
+    {{
+      "type": "education|work_experience|certification|achievement|other",
+      "requirement": "string (what JD asks)",
+      "status": "missing|present|uncertain",
+      "evidence_resume": "string (quote/summary from resume if present else empty)",
+      "evidence_jd": "string (quote/summary from JD)",
+      "fix_suggestion": "string (what to add/change in resume)"
+    }}
+  ],
+  "improvements": [
+    "string actionable bullet",
+    "..."
+  ]
+}}
+
+RESUME EDUCATION SECTION:
+{(resume_sections or {}).get("education_text","")}
+
+RESUME EXPERIENCE SECTION:
+{(resume_sections or {}).get("experience_text","")}
+
+RESUME ACHIEVEMENTS SECTION:
+{(resume_sections or {}).get("achievements_text","")}
+
+RESUME CERTIFICATIONS SECTION:
+{(resume_sections or {}).get("certifications_text","")}
+
+RESUME PROJECTS SECTION:
+{(resume_sections or {}).get("projects_text","")}
+
+RESUME SKILLS SECTION:
+{(resume_sections or {}).get("skills_text","")}
+
+FULL RESUME (optional):
+{(resume_sections or {}).get("full_text","")}
+
+JOB DESCRIPTION:
+{(jd_text or "")[:12000]}
+""".strip()
+
+    try:
+        raw = (get_gemini_response(prompt) or "").strip()
+    except Exception:
+        raw = ""
+
+    data = _extract_json_obj(raw) or {}
+
+    mr = data.get("missing_requirements") or []
+    # Only keep missing/uncertain for UI (present items create noise)
+    filtered = []
+    for r in mr:
+        if not isinstance(r, dict):
+            continue
+        st = str(r.get("status") or "").lower().strip()
+        if st in ("missing", "uncertain"):
+            filtered.append({
+                "type": r.get("type") or "other",
+                "requirement": r.get("requirement") or "",
+                "status": st or "missing",
+                "evidence_resume": r.get("evidence_resume") or "",
+                "evidence_jd": r.get("evidence_jd") or "",
+                "fix_suggestion": r.get("fix_suggestion") or "",
+            })
+
+    improvements = data.get("improvements") or []
+    improvements = [str(x).strip() for x in improvements if str(x).strip()]
+
+    return {
+        "missing_requirements": filtered,
+        "improvements": improvements,
+    }
+
+
+
+
+
+def _ats_sessions_col(db):
+    return db["ats_sessions"]
+
+
+def _ats_session_public(doc):
+    if not doc:
+        return None
+    return {
+        "session_id": doc.get("session_id"),
+        "created_at": (doc.get("created_at") or datetime.utcnow()).isoformat(),
+        "updated_at": (doc.get("updated_at") or doc.get("created_at") or datetime.utcnow()).isoformat(),
+        "company": doc.get("company") or "",
+        "role": doc.get("role") or "",
+        "title": doc.get("title") or "",
+        "resume_filename": doc.get("resume_filename") or "",
+        "jd_source": doc.get("jd_source") or "",
+        "has_tailored": bool(doc.get("tailored_sections")),
+        "ats": doc.get("ats") or {},
+        "analytics": doc.get("analytics") or {},
+    }
+
+def _gemini_tailor_prompt(jd_text: str, resume_text: str, jd_struct: dict, resume_struct: dict, ats_struct: dict) -> str:
+    import json
+    return f"""You are an ATS scoring engine + resume tailoring assistant.
+
+You will be given:
+- Job Description (JD) text
+- Resume text
+- Parsed structured signals (skills/projects/experience/education)
+- A deterministic ATS score + matched/missing skills computed by our parser
+
+TASKS:
+1) Use the structured signals to produce an ATS score from 0-100 (can be same as deterministic score, or adjust slightly if justified).
+2) Explain score briefly (2-4 lines).
+3) Provide 10-12 prioritized improvements (bullet list).
+4) Provide a tailored resume draft (TEXT) that the candidate can copy-paste:
+   - Professional Summary (3-4 lines)
+   - Skills (grouped)
+   - Experience bullets (rewrite 6-10 bullets max, STAR + metrics placeholders)
+   - Projects bullets (rewrite 4-6 bullets max)
+   - Keep it truthful: DO NOT invent companies, degrees, or years not in the resume text.
+   - You may rephrase existing work/projects and add missing keywords ONLY if they are reasonable to claim as \"familiarity\" (not years of experience).
+Return ONLY JSON with keys:
+ats_score, reasoning_summary, improvements, missing_skills_priority, tailored_resume_text
+
+Deterministic signals (JSON):
+JD_STRUCT={json.dumps(jd_struct, ensure_ascii=False)[:12000]}
+RESUME_STRUCT={json.dumps(resume_struct, ensure_ascii=False)[:12000]}
+ATS_STRUCT={json.dumps(ats_struct, ensure_ascii=False)[:12000]}
+
+JD_TEXT:
+{(jd_text or "")[:12000]}
+
+RESUME_TEXT:
+{(resume_text or "")[:20000]}
+"""
+
+@app.post("/ats/analyze")
+def ats_analyze():
+    """multipart/form-data: resume_file (PDF/DOCX) + jd_file (PDF) OR jd_text.
+    Also accepts: company, role (strings). Creates an ATS session stored in DB.
+    """
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+
+    uid = user.get("uid")
+
+    resume_file = request.files.get("resume_file")
+    if not resume_file:
+        return jsonify({"error": "resume_file is required"}), 400
+    resume_text, resume_kind, resume_raw = _extract_resume_text(resume_file)
+    if not resume_text:
+        return jsonify({"error": "Could not extract text from resume PDF"}), 400
+
+    jd_text = (request.form.get("jd_text") or "").strip()
+    jd_file = request.files.get("jd_file")
+    if (not jd_text) and jd_file:
+        jd_text = _extract_pdf_text_bytes(jd_file.read() or b"")
+    if not jd_text:
+        return jsonify({"error": "Provide jd_text or jd_file (PDF)"}), 400
+
+    company = (request.form.get("company") or "").strip()
+    role = (request.form.get("role") or "").strip()
+    title = f"{company}-{role}".strip("-").strip() if (company or role) else "ATS Session"
+
+    jd_source = "text"
+    try:
+        if jd_file and getattr(jd_file, "filename", ""):
+            jd_source = f"file:{jd_file.filename}"
+    except Exception:
+        pass
+
+    resume_struct = _parse_resume_structured(resume_text)
+
+    # Optional: Affinda extraction (for cleaner skills/structure). Uses requests (no SDK).
+    try:
+        aff = _affinda_parse_resume(resume_raw, filename=(getattr(resume_file, "filename", "") or "resume.pdf")) if resume_raw else {"ok": False}
+    except Exception:
+        aff = {"ok": False}
+    resume_struct = _merge_resume_struct_with_affinda(resume_struct, aff)
+
+    jd_struct = _parse_jd_structured(jd_text)
+    ats_struct = _compute_ats_score_structured(jd_struct, resume_struct)
+    analytics = _compute_ats_analytics(jd_text, jd_struct, resume_struct, ats_struct)
+
+    # Semantic non-skill requirements (education / experience / achievements) via Gemini
+    resume_sections = _split_into_sections(resume_text)
+    req_eval = _gemini_requirements_and_improvements(jd_text, _resume_sections_for_gemini(resume_text))
+    missing_requirements = req_eval.get("missing_requirements") or []
+    req_improvements = req_eval.get("improvements") or []
+
+    # Missing skill priority (weighted by JD frequency if available)
+    missing_skills_priority = []
+    try:
+        msw = (analytics or {}).get("missing_skill_weights") or []
+        if msw and isinstance(msw, list):
+            msw2 = []
+            for it in msw:
+                if isinstance(it, dict):
+                    sk = it.get("skill") or it.get("name") or it.get("key")
+                    wt = it.get("weight") or it.get("freq") or 1
+                    if sk:
+                        msw2.append((str(sk), float(wt) if isinstance(wt, (int, float)) else 1.0))
+            msw2.sort(key=lambda x: x[1], reverse=True)
+            missing_skills_priority = [x[0] for x in msw2[:25]]
+    except Exception:
+        missing_skills_priority = []
+    if not missing_skills_priority:
+        missing_skills_priority = (ats_struct.get("missing_skills") or [])[:25]
+
+    # Option 1: rewrite only weak sections
+    weak_section_keys = _pick_weak_sections(resume_sections, ats_struct, missing_requirements)
+
+    # Gemini: resume-specific improvements + OLD->NEW section rewrites
+    gem = _gemini_ats_section_rewrites(jd_text, resume_sections, missing_skills_priority, weak_section_keys) or {}
+
+    tips = {}
+    tips["missing_skills_priority"] = missing_skills_priority
+    tips["missing_requirements"] = missing_requirements
+    tips["weak_sections"] = weak_section_keys
+
+    # Improvements (resume-specific)
+    tips["improvements"] = []
+    if isinstance(gem, dict) and isinstance(gem.get("improvements"), list):
+        tips["improvements"] = [str(x).strip() for x in gem.get("improvements") if str(x).strip()][:20]
+    if not tips["improvements"]:
+        tips["improvements"] = [str(x).strip() for x in (req_improvements or []) if str(x).strip()][:20]
+    if not tips["improvements"]:
+        tips["improvements"] = [
+            "Add missing JD keywords naturally inside your existing bullets (avoid keyword stuffing).",
+            "Quantify impact in 2–4 key bullets (use concrete numbers: [X%], [N users], [latency], etc.).",
+            "Strengthen the Skills section by grouping tools by category and including the top missing skills you can honestly claim as familiarity.",
+        ]
+
+    # Tailored diff (copy/paste ready)
+    tips["tailored_diff"] = []
+    if isinstance(gem, dict) and isinstance(gem.get("tailored_diff"), list):
+        # Normalize section titles
+        key_to_title = {"skills": "Skills", "experience": "Experience", "projects": "Projects", "education": "Education"}
+        td = []
+        for b in gem.get("tailored_diff") or []:
+            if not isinstance(b, dict):
+                continue
+            sec = (b.get("section") or "").strip()
+            # if Gemini returned key names, map them
+            sec_norm = sec.lower().strip()
+            sec_title = key_to_title.get(sec_norm, sec or "Section")
+            oldc = (b.get("old_content") or "").strip()
+            newc = (b.get("new_content") or "").strip()
+            if not newc:
+                continue
+            td.append({
+                "section": sec_title,
+                "replace_instruction": b.get("replace_instruction") or f"Replace your '{sec_title}' section with the NEW content below.",
+                "old_content": oldc,
+                "new_content": newc,
+            })
+        tips["tailored_diff"] = td
+
+    # Deterministic fallback so UI is never empty
+    if not tips["tailored_diff"]:
+        td = []
+        if "skills" in weak_section_keys and (resume_sections.get("skills") or "").strip():
+            oldc = (resume_sections.get("skills") or "").strip()
+            add = ", ".join(missing_skills_priority[:10])
+            newc = oldc
+            if add and add.lower() not in oldc.lower():
+                newc = (oldc + "\n\nAdditional keywords to consider (only if truthful): " + add).strip()
+            td.append({
+                "section": "Skills",
+                "replace_instruction": "Update your Skills section by adding the NEW content below (only include what you can honestly claim).",
+                "old_content": oldc,
+                "new_content": newc,
+            })
+        tips["tailored_diff"] = td
+
+    # For API backward-compatibility
+    jd_requirements = []
+    tailored_sections = (tips.get("tailored_sections") or {}) if isinstance(tips, dict) else {}
+
+    # Store a reusable DOCX template for download (keeps the user's template)
+    fs = gridfs.GridFS(get_db())
+    template_file_id = None
+    try:
+        if resume_kind == "docx":
+            template_bytes = resume_raw
+        else:
+            converted = _pdf_bytes_to_docx_document(resume_raw)
+            if converted is not None:
+                bio_buf = io.BytesIO()
+                converted.save(bio_buf)
+                template_bytes = bio_buf.getvalue()
+            else:
+                template_bytes = None
+        if template_bytes:
+            template_file_id = fs.put(template_bytes, filename=f"template_{uid}_{int(time.time())}.docx", contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    except Exception:
+        template_file_id = None
+
+    session_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+    doc = {
+        "session_id": session_id,
+        "uid": uid,
+        "created_at": now,
+        "updated_at": now,
+        "company": company,
+        "role": role,
+        "title": title,
+        "resume_filename": getattr(resume_file, "filename", "") or "",
+        "resume_kind": resume_kind,
+        "resume_text": resume_text[:80_000],
+        "jd_text": jd_text[:80_000],
+        "jd_source": jd_source,
+        "parsed_resume": resume_struct,
+        "parsed_jd": jd_struct,
+        "ats": ats_struct,
+        "analytics": analytics,
+        "tips": tips,
+        "jd_requirements": jd_requirements,
+        "missing_requirements": missing_requirements,
+        "tailored_sections": tailored_sections,
+        "template_file_id": template_file_id,
+    }
+    try:
+        col = _ats_sessions_col(get_db())
+        col.insert_one(doc)
+    except Exception:
+        # If DB insert fails, still return analysis without history.
+        session_id = ""
+
+
+    # ✅ Email the ATS summary to the user (non-blocking)
+    try:
+        to_email = (user.get("email") or "").strip()
+        if not to_email:
+            try:
+                udoc = get_db().users.find_one({"uid": uid}) if uid else None
+                to_email = ((udoc or {}).get("email") or "").strip()
+            except Exception:
+                to_email = ""
+
+        if to_email:
+            score = (ats_struct or {}).get("score")
+            coverage = (ats_struct or {}).get("coverage")
+            matched = (ats_struct or {}).get("matched_skills") or []
+            missing = (ats_struct or {}).get("missing_skills") or []
+            miss_req = missing_requirements or []
+
+            def _li(items):
+                # Render a simple <ul> list. Items may be strings or dicts.
+                out = []
+                for x in (items or []):
+                    try:
+                        if isinstance(x, dict):
+                            # Best-effort flatten dicts (avoid JSON blobs in mail)
+                            parts = []
+                            for k in ("name", "skill", "requirement", "text", "title"):
+                                v = x.get(k)
+                                if v:
+                                    parts.append(str(v))
+                                    break
+                            if not parts:
+                                kv = []
+                                for k, v in list(x.items())[:6]:
+                                    if v is None or v == "":
+                                        continue
+                                    kv.append(f"{k}: {v}")
+                                parts.append("; ".join(kv) if kv else "—")
+                            out.append(f"<li>{_html_escape(' '.join(parts).strip())}</li>")
+                        else:
+                            out.append(f"<li>{_html_escape(str(x))}</li>")
+                    except Exception:
+                        out.append("<li>—</li>")
+                return "".join(out) or "<li>—</li>"
+
+            def _li_missing_requirements(items):
+                # Pretty formatting for Gemini requirement objects:
+                # {requirement, status, fix_suggestion, ...}
+                out = []
+                for x in (items or []):
+                    try:
+                        if isinstance(x, dict):
+                            req = (x.get("requirement") or x.get("text") or x.get("title") or "Requirement")
+                            req = (req or "Requirement").strip()
+                            status = (x.get("status") or "").strip()
+                            sugg = (x.get("fix_suggestion") or x.get("suggestion") or "").strip()
+                            line = f"<strong>{_html_escape(req)}</strong>"
+                            if status:
+                                st = status.lower()
+                                if "miss" in st:
+                                    color = "#dc2626"
+                                elif "met" in st or "pass" in st:
+                                    color = "#16a34a"
+                                else:
+                                    color = "#6b7280"
+                                line += f' <span style="color:{color};font-weight:600;">({_html_escape(status)})</span>'
+                            if sugg:
+                                line += f'<div style="margin-top:4px;color:#374151;font-size:12px;line-height:1.35;">{_html_escape(sugg)}</div>'
+                            out.append(f"<li style=\"margin-bottom:10px;\">{line}</li>")
+                        else:
+                            out.append(f"<li>{_html_escape(str(x))}</li>")
+                    except Exception:
+                        out.append("<li>—</li>")
+                return "".join(out) or "<li>—</li>"
+
+            # Company/Role context (shown in mail subject and header)
+            cr = " — ".join([x for x in [company.strip() if isinstance(company, str) else "", role.strip() if isinstance(role, str) else ""] if x]).strip()
+            mail_title = "Zenith ATS Intelligence Report" + (f" — {cr}" if cr else "")
+            mail_subtitle = (
+                (f"Company: {_html_escape(company)} • Role: {_html_escape(role)}<br/>" if (company or role) else "")
+                + f"ATS Score: {score if score is not None else '—'}/100 • Match: {coverage if coverage is not None else '—'}%"
+            )
+            mail_subject = "Zenith ATS Intelligence — " + (cr if cr else "Your ATS Score & Match %")
+            
+            body_html = f"""
+              <p style="margin:0 0 10px 0;">Here is your ATS evaluation summary.</p>
+              <div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 16px 0;">
+                <div style="padding:10px 12px;border:1px solid #e5e7eb;border-radius:14px;background:#ffffff;">
+                  <div style="font-size:12px;color:#6b7280;">ATS Score</div>
+                  <div style="font-size:18px;font-weight:700;color:#111827;">{score if score is not None else "—"}/100</div>
+                </div>
+                <div style="padding:10px 12px;border:1px solid #e5e7eb;border-radius:14px;background:#ffffff;">
+                  <div style="font-size:12px;color:#6b7280;">Match</div>
+                  <div style="font-size:18px;font-weight:700;color:#111827;">{coverage if coverage is not None else "—"}%</div>
+                </div>
+              </div>
+
+              <h3 style="margin:14px 0 6px 0;font-size:14px;">Matched skills</h3>
+              <ul style="margin:0 0 10px 18px;color:#111827;">{_li(matched[:30])}</ul>
+
+              <h3 style="margin:14px 0 6px 0;font-size:14px;">Missing skills</h3>
+              <ul style="margin:0 0 10px 18px;color:#111827;">{_li(missing[:30])}</ul>
+
+              <h3 style="margin:14px 0 6px 0;font-size:14px;">Missing requirements (from JD)</h3>
+              <ul style="margin:0 0 10px 18px;color:#111827;">{_li_missing_requirements(miss_req[:20])}</ul>
+
+              <p style="margin:14px 0 0 0;color:#6b7280;font-size:12px;">
+                Tip: Add missing keywords naturally in your projects/experience bullets and keep the resume concise (1–2 pages).
+              </p>
+            """
+
+            html = _brand_email(
+                title=mail_title,
+                subtitle=mail_subtitle,
+                body_html=body_html,
+                cta_url="/ats-intelligence",
+                cta_text="Open ATS Intelligence",
+            )
+
+            _send_email(
+                to_email,
+                mail_subject,
+                html,
+                kind="ats",
+                reply_to=(os.getenv("CONTACT_INBOX") or os.getenv("ADMIN_EMAIL")),
+            )
+    except Exception as e:
+        try:
+            import traceback
+            print("[email] ATS report send failed:", repr(e))
+            traceback.print_exc()
+        except Exception:
+            pass
+    return jsonify({
+        "ok": True,
+        "session": _ats_session_public(doc) if session_id else None,
+        "session_id": session_id,
+        "ats": ats_struct,
+        "analytics": analytics,
+        "parsed_resume": resume_struct,
+        "parsed_jd": jd_struct,
+        "tips": tips,
+        "jd_requirements": jd_requirements,
+        "missing_requirements": missing_requirements,
     })
 
 
+@app.get("/ats/sessions")
+def ats_list_sessions():
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    col = _ats_sessions_col(get_db())
+    items = list(col.find({"uid": uid}).sort("created_at", -1).limit(100))
+    return jsonify({"ok": True, "sessions": [_ats_session_public(d) for d in items]})
+
+
+@app.get("/ats/sessions/<session_id>")
+def ats_get_session(session_id):
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    col = _ats_sessions_col(get_db())
+    doc = col.find_one({"uid": uid, "session_id": session_id})
+    if not doc:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify({
+        "ok": True,
+        "session": _ats_session_public(doc),
+        "parsed_resume": doc.get("parsed_resume") or {},
+        "parsed_jd": doc.get("parsed_jd") or {},
+        "ats": doc.get("ats") or {},
+        "analytics": doc.get("analytics") or {},
+        "tips": doc.get("tips") or {},
+    })
+
+
+@app.delete("/ats/sessions/<session_id>")
+def ats_delete_session(session_id):
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    db = get_db()
+    col = _ats_sessions_col(db)
+    doc = col.find_one({"uid": uid, "session_id": session_id})
+    if not doc:
+        return jsonify({"error": "Session not found"}), 404
+
+    # delete GridFS template if present
+    try:
+        fid = doc.get("template_file_id")
+        if fid:
+            fs = gridfs.GridFS(db)
+            fs.delete(fid)
+    except Exception:
+        pass
+
+    col.delete_one({"uid": uid, "session_id": session_id})
+    return jsonify({"ok": True})
+
+
+@app.get("/ats/sessions/<session_id>/tailored_docx")
+def ats_download_tailored_docx(session_id):
+    """Download tailored resume DOCX from a stored ATS session (preserves template)."""
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    db = get_db()
+    col = _ats_sessions_col(db)
+    doc = col.find_one({"uid": uid, "session_id": session_id})
+    if not doc:
+        return jsonify({"error": "Session not found"}), 404
+
+    fs = gridfs.GridFS(db)
+    template_bytes = None
+    try:
+        fid = doc.get("template_file_id")
+        if fid:
+            template_bytes = fs.get(fid).read()
+    except Exception:
+        template_bytes = None
+
+    # Fallback if template missing
+    if template_bytes:
+        try:
+            docx_doc = Document(io.BytesIO(template_bytes))
+        except Exception:
+            docx_doc = Document()
+    else:
+        docx_doc = Document()
+        docx_doc.add_paragraph("TAILORED RESUME")
+        docx_doc.add_paragraph("")
+
+    tailored = doc.get("tailored_sections") or {}
+    summary_lines = tailored.get("professional_summary") or []
+    skills_lines = tailored.get("skills") or []
+    exp_bullets = tailored.get("experience_bullets") or []
+    proj_bullets = tailored.get("projects_bullets") or []
+    edu_lines = tailored.get("education_lines") or []
+
+    _docx_replace_section(docx_doc, [r"summary", r"professional summary", r"objective"], summary_lines, bullet=False)
+    _docx_replace_section(docx_doc, [r"skills", r"technical skills"], skills_lines, bullet=True)
+    _docx_replace_section(docx_doc, [r"experience", r"work experience", r"employment"], exp_bullets, bullet=True)
+    _docx_replace_section(docx_doc, [r"projects", r"project experience"], proj_bullets, bullet=True)
+    _docx_replace_section(docx_doc, [r"education"], edu_lines, bullet=False)
+
+    out = io.BytesIO()
+    docx_doc.save(out)
+    out.seek(0)
+    safe_title = (doc.get("title") or "tailored_resume").strip().replace("/", "-").replace("\\", "-")
+    fname = f"{safe_title or 'tailored_resume'}.docx"
+    return send_file(out, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                     as_attachment=True, download_name=fname)
+
+
+def _build_interview_prompt(resume_text: str, jd_text: str, role_target: str, chat_history: list, user_message: str) -> str:
+    # Keep resume/JD compact for prompt
+    resume_text = (resume_text or "")[:30_000]
+    jd_text = (jd_text or "")[:18_000]
+
+    # Format last few turns
+    turns = (chat_history or [])[-12:]
+    hist_lines = []
+    for t in turns:
+        r = (t.get("role") or "").lower()
+        c = (t.get("content") or "").strip()
+        if not c:
+            continue
+        label = "Candidate" if r == "candidate" else "HR"
+        hist_lines.append(f"{label}: {c}")
+    history_block = "\n".join(hist_lines).strip()
+
+    role_line = f"Target role: {role_target}\n" if role_target else ""
+
+    return f"""
+You are an expert HR + technical interviewer.
+Your job: conduct a realistic mock interview based on the candidate's resume AND the provided job description (JD).
+Rules:
+- Ask one strong question at a time.
+- Mix behavioral + technical + project deep-dives aligned to the JD.
+- If the candidate's answer is weak/unclear, ask a follow-up.
+- Keep responses concise (2-6 sentences). No long essays.
+- Do NOT invent resume details; only use what is present in the resume text.
+- If the candidate asks for feedback, give actionable feedback and a better sample answer.
+
+{role_line}
+JOB DESCRIPTION (excerpt):
+{jd_text}
+
+RESUME (excerpt):
+{resume_text}
+
+CHAT SO FAR:
+{history_block}
+
+Candidate's latest message:
+{user_message}
+
+Now respond as HR interviewer.
+""".strip()
+
+
+
+
+@app.post("/ats/tailor_docx")
+def ats_tailor_docx():
+    """Return a tailored DOCX. If the uploaded resume is DOCX, preserves the original template."""
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+
+    resume_file = request.files.get("resume_file")
+    if not resume_file:
+        return jsonify({"error": "resume_file is required"}), 400
+
+    jd_file = request.files.get("jd_file")
+    jd_text = (request.form.get("jd_text") or "").strip()
+
+    # JD text
+    if jd_file and not jd_text:
+        jd_bytes = jd_file.read() or b""
+        jd_text = _extract_pdf_text_bytes(jd_bytes)
+    if not jd_text:
+        return jsonify({"error": "Provide jd_text or jd_file"}), 400
+
+    resume_text, resume_kind, resume_raw = _extract_resume_text(resume_file)
+    if not resume_text:
+        return jsonify({"error": "Could not read resume. Upload a PDF or DOCX."}), 400
+
+    # parse + score (local algorithm)
+    jd_struct = _extract_jd_struct(jd_text)
+    resume_struct = _extract_resume_struct(resume_text)
+    ats_struct = _compute_ats(jd_struct, resume_struct)
+    ats_struct["matched_skills"] = _filter_unwanted_keywords(ats_struct.get("matched_skills", []))
+    ats_struct["missing_skills"] = _filter_unwanted_keywords(ats_struct.get("missing_skills", []))
+
+    # Gemini tailored sections
+    prompt = _build_gemini_tailor_prompt(jd_struct, resume_struct, ats_struct, jd_text, resume_text)
+    tips = _gemini_json(prompt)
+
+    tailored = (tips or {}).get("tailored_sections") or {}
+    summary_lines = tailored.get("professional_summary") or []
+    skills_lines = tailored.get("skills") or []
+    exp_bullets = tailored.get("experience_bullets") or []
+    proj_bullets = tailored.get("projects_bullets") or []
+    edu_lines = tailored.get("education_lines") or []
+
+    # Build DOCX
+    if resume_kind == "docx":
+        try:
+            doc = Document(io.BytesIO(resume_raw))
+        except Exception:
+            doc = Document()
+    else:
+        # PDF: try to convert to DOCX first (best-effort), then preserve that converted template.
+        converted = _pdf_bytes_to_docx_document(resume_raw)
+        if converted is not None:
+            doc = converted
+        else:
+            # Fallback: PDF cannot preserve exact template; create a clean docx
+            doc = Document()
+            doc.add_paragraph("TAILORED RESUME")
+            doc.add_paragraph("")
+
+    # Replace common sections (best-effort)
+    _docx_replace_section(doc, [r"summary", r"professional summary", r"objective"], summary_lines, bullet=False)
+    _docx_replace_section(doc, [r"skills", r"technical skills"], skills_lines, bullet=True)
+    _docx_replace_section(doc, [r"experience", r"work experience", r"employment"], exp_bullets, bullet=True)
+    _docx_replace_section(doc, [r"projects", r"project experience"], proj_bullets, bullet=True)
+    _docx_replace_section(doc, [r"education"], edu_lines, bullet=False)
+
+    out = io.BytesIO()
+    doc.save(out)
+    out.seek(0)
+
+    fname = "tailored_resume.docx"
+    return send_file(out, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                     as_attachment=True, download_name=fname)
+@app.post("/interview/chat")
+def interview_chat():
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+
+    payload = request.get_json(silent=True) or {}
+    session_id = (payload.get("session_id") or "").strip()
+    message = (payload.get("message") or "").strip()
+    if not session_id:
+        return jsonify({"error": "session_id is required"}), 400
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+
+    db = get_db()
+    col = _interview_sessions_col(db)
+    doc = col.find_one({"uid": uid, "session_id": session_id})
+    if not doc:
+        return jsonify({"error": "Session not found"}), 404
+    if not doc.get("resume_text"):
+        return jsonify({"error": "Please upload your resume first"}), 400
+    if not doc.get("jd_text"):
+        return jsonify({"error": "Please set a job description (JD) first"}), 400
+
+    prompt = _build_interview_prompt(
+        doc.get("resume_text", ""),
+        doc.get("jd_text", ""),
+        doc.get("role_target", ""),
+        doc.get("chat_history", []),
+        message
+    )
+
+    try:
+        reply = get_gemini_response(prompt)
+    except Exception as e:
+        return jsonify({"error": f"Gemini error: {e}"}), 500
+
+    now_iso = datetime.utcnow().isoformat()
+    history = doc.get("chat_history", [])
+    history.append({"role": "candidate", "content": message, "ts": now_iso})
+    history.append({"role": "hr", "content": reply, "ts": now_iso})
+
+    new_count = int(doc.get("message_count") or 0) + 1
+    col.update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"chat_history": history, "message_count": new_count, "updated_at": datetime.utcnow()}}
+    )
+
+    return jsonify({"ok": True, "response": reply, "session_id": session_id, "message_count": new_count})
+
+
+# ===================== MOCK TEST (General Apti / Tech Apti / Coding) =====================
+# Modes:
+# - general aptitude: quant + verbal/logical
+# - tech aptitude: DSA/OOP/OS/CN/DBMS basics
+# - coding: DSA-style coding, validated via Judge0 (Java/C/C++/Python)
+#
+# Storage:
+
+
+# ----------------- ADMIN: USER & COURSE DETAIL (DRILLDOWN) -----------------
+@app.get("/admin/user/<uid>/summary")
+def admin_user_summary(uid):
+    """User drilldown summary used by admin UI."""
+    _, err = require_admin()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    db = get_db()
+    u = db.users.find_one({"uid": uid}, projection={"_id": 0}) or {}
+    if not u:
+        return jsonify({"ok": False, "error": "User not found"}), 404
+
+    # courses studying (distinct)
+    studying = sorted({(x.get("courseTitle") or "").strip() for x in db.course_states.find({"uid": uid}, projection={"_id": 0, "courseTitle": 1}) if x.get("courseTitle")})
+
+    # holds
+    holds = sorted({(x.get("courseTitle") or "").strip() for x in db.course_holds.find({"uid": uid, "held": True}, projection={"_id": 0, "courseTitle": 1}) if x.get("courseTitle")})
+
+    # mock tests
+    mt_total = db.mocktest_sessions.count_documents({"uid": uid})
+    mt_submitted = db.mocktest_sessions.count_documents({"uid": uid, "submittedAt": {"$exists": True}})
+
+    # course progress
+    cp_docs = list(db.course_progress.find({"uid": uid}, projection={"_id": 0, "courseTitle": 1, "quizPassedMap": 1, "updatedAt": 1}))
+
+    return jsonify({
+        "ok": True,
+        "user": {"uid": u.get("uid"), "name": u.get("name"), "email": u.get("email"), "photoURL": u.get("photoURL"), "isAdmin": bool(u.get("isAdmin"))},
+        "studyingCourses": studying,
+        "heldCourses": holds,
+        "mocktests": {"total": int(mt_total), "submitted": int(mt_submitted)},
+        "courseProgressCount": len(cp_docs),
+    })
+
+
+@app.get("/admin/user/<uid>/courses-studying")
+def admin_user_courses_studying(uid):
+    _, err = require_admin()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    db = get_db()
+    titles = {}
+    for st in db.course_states.find({"uid": uid}, projection={"_id": 0, "courseTitle": 1, "updatedAt": 1}):
+        ct = (st.get("courseTitle") or "").strip()
+        if not ct:
+            continue
+        prev = titles.get(ct)
+        if not prev or (st.get("updatedAt") and st.get("updatedAt") > (prev.get("updatedAt") or 0)):
+            titles[ct] = {"courseTitle": ct, "updatedAt": st.get("updatedAt")}
+
+    out = []
+    for ct, info in titles.items():
+        out.append({
+            "courseTitle": ct,
+            "held": is_course_held(uid, ct),
+            "updatedAt": info.get("updatedAt"),
+        })
+
+    out.sort(key=lambda x: (x.get("held") is False, x.get("updatedAt") or 0), reverse=True)
+    return jsonify({"ok": True, "courses": out})
+
+
+@app.get("/admin/user/<uid>/course-progress")
+def admin_user_course_progress(uid):
+    """Per-course quiz progress for a single user."""
+    _, err = require_admin()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    db = get_db()
+
+    def count_videos(obj):
+        if obj is None:
+            return 0
+        if isinstance(obj, list):
+            return sum(count_videos(it) for it in obj)
+        if isinstance(obj, dict):
+            if isinstance(obj.get("videos"), list):
+                return len(obj.get("videos"))
+            if "video" in obj and ("topic" in obj or "title" in obj):
+                return 1
+            return sum(count_videos(v) for v in obj.values())
+        return 0
+
+    totals = {}
+    for st in db.course_states.find({}, projection={"_id": 0, "courseTitle": 1, "videos": 1}):
+        ct = st.get("courseTitle")
+        if not ct:
+            continue
+        totals[ct] = max(totals.get(ct, 0), count_videos(st.get("videos")))
+
+    def count_true(dct):
+        if not isinstance(dct, dict):
+            return 0
+        return sum(1 for _, v in dct.items() if bool(v))
+
+    rows = []
+    for cp in db.course_progress.find({"uid": uid}, projection={"_id": 0, "courseTitle": 1, "quizPassedMap": 1, "updatedAt": 1}):
+        ct = cp.get("courseTitle")
+        total = int(totals.get(ct, 0))
+        passed = count_true(cp.get("quizPassedMap") or {})
+        pct = int(round((passed / total) * 100)) if total else 0
+        rows.append({
+            "courseTitle": ct,
+            "totalQuizzes": total,
+            "passedQuizzes": passed,
+            "percent": pct,
+            "held": is_course_held(uid, ct),
+            "updatedAt": cp.get("updatedAt"),
+        })
+
+    rows.sort(key=lambda x: (x.get("held") is False, x.get("percent") or 0), reverse=True)
+    return jsonify({"ok": True, "rows": rows})
+
+
+@app.get("/admin/user/<uid>/course/<course_title>/quiz-results")
+def admin_user_course_quiz_results(uid, course_title):
+    """Video-wise quiz attempt summaries for a given user + course (Admin drilldown)."""
+    _, err = require_admin()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    db = get_db()
+    # normalize incoming title for tolerant DB lookup
+    course_title = (course_title or "").strip()
+    ct_re = f"^\\s*{re.escape(course_title)}\\s*$"
+
+    # Pull compact per-video quiz attempt docs (written by /submit-quiz)
+    # Sort by latest first. Legacy docs may not have `videoNo`, so sorting by it
+    # can make us miss older stored results.
+    _docs = list(
+        db.quiz_attempts.find(
+            {"uid": uid, "courseTitle": {"$regex": ct_re, "$options": "i"}},
+            projection={"_id": 0},
+        ).sort([("updatedAt", -1), ("createdAt", -1)])
+    )
+
+    # If quiz_attempts is missing (older data / video number couldn't be derived),
+    # we still want to show a video-wise table using course_states + course_progress.
+    # That way Admin gets per-video status + link even if scores are unavailable.
+    def _get_url(obj):
+        if obj is None:
+            return ""
+        if isinstance(obj, str):
+            return obj.strip()
+        if isinstance(obj, dict):
+            return (obj.get("videoUrl")
+                    or obj.get("video_url")
+                    or obj.get("url")
+                    or obj.get("video")
+                    or "").strip()
+        return str(obj).strip()
+
+    def _flatten_video_urls(node):
+        out = []
+        if node is None:
+            return out
+        if isinstance(node, str):
+            u = node.strip()
+            if u:
+                out.append(u)
+            return out
+        if isinstance(node, list):
+            for it in node:
+                out.extend(_flatten_video_urls(it))
+            return out
+        if isinstance(node, dict):
+            # common shapes
+            if isinstance(node.get("videos"), list):
+                for it in (node.get("videos") or []):
+                    u = _get_url(it)
+                    if u:
+                        out.append(u)
+                return out
+            # week-style dict: {"Week 1": [ ... ]}
+            for v in node.values():
+                out.extend(_flatten_video_urls(v))
+            return out
+        return out
+
+    def _flatten_video_entries(node):
+        """Return list of {title,url} in order, de-duped by url."""
+        out = []
+
+        def _push(title, url):
+            u = (url or "").strip()
+            if not u:
+                return
+            t = (title or "").strip() or None
+            out.append({"title": t, "url": u})
+
+        def _walk(n):
+            if n is None:
+                return
+            if isinstance(n, str):
+                _push(None, n)
+                return
+            if isinstance(n, list):
+                for it in n:
+                    _walk(it)
+                return
+            if isinstance(n, dict):
+                u = n.get("url") or n.get("video_url") or n.get("videoUrl") or n.get("link") or n.get("video")
+                t = n.get("title") or n.get("video_title") or n.get("name") or n.get("label") or n.get("topic")
+                if u:
+                    _push(t, u)
+                # common containers
+                for k in ["videos", "items", "lessons", "playlist", "week", "weeks", "modules"]:
+                    if k in n:
+                        _walk(n.get(k))
+                # also try values
+                if not u:
+                    for v in n.values():
+                        if isinstance(v, (dict, list)):
+                            _walk(v)
+                return
+
+        _walk(node)
+        seen = set()
+        dedup = []
+        for it in out:
+            u = it.get("url")
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            dedup.append(it)
+        return dedup
+
+    # Build index from stored attempts
+    by_video_no = {}
+    attempts_count = {}
+    total_videos = None
+    for d in _docs:
+        try:
+            tv = d.get("totalVideos")
+            if tv:
+                total_videos = int(tv)
+        except Exception:
+            pass
+
+        # Backward compatibility: older rows may store the video number under
+        # different field names.
+        vn = (
+            d.get("videoNo")
+            or d.get("video_no")
+            or d.get("videoIndex")
+            or d.get("video_index")
+            or d.get("video")
+        )
+        try:
+            vn = int(vn) if vn is not None else None
+        except Exception:
+            vn = None
+        if not vn:
+            continue
+        # count all attempt docs per videoNo (used for Admin display)
+        attempts_count[vn] = int(attempts_count.get(vn, 0)) + 1
+        # keep the newest doc per videoNo (cursor is sorted by updatedAt desc)
+        if vn not in by_video_no:
+            by_video_no[vn] = d
+
+    # Pull course videos (title + url). Use this user's course_state to avoid cross-user mismatches.
+    cs = db.course_states.find_one(
+        {"uid": uid, "courseTitle": {"$regex": ct_re, "$options": "i"}},
+        projection={"_id": 0, "videos": 1},
+    ) or {}
+    video_list = _flatten_video_entries(cs.get("videos"))
+    # Fallback: in some versions, the canonical course structure is stored in a
+    # shared `courses` collection (not per-user).
+    if not video_list:
+        try:
+            cdoc = db.courses.find_one(
+                {"courseTitle": {"$regex": ct_re, "$options": "i"}},
+                projection={"_id": 0, "videos": 1},
+            ) or {}
+            video_list = _flatten_video_entries(cdoc.get("videos")) or video_list
+        except Exception:
+            pass
+    video_urls = [it.get("url") for it in video_list if isinstance(it, dict) and isinstance(it.get("url"), str)]
+
+    # Pull pass map so we can show status even when scores are missing
+    cp = db.course_progress.find_one(
+        {"uid": uid, "courseTitle": {"$regex": ct_re, "$options": "i"}},
+        projection={"_id": 0, "quizPassedMap": 1, "quizSubmittedMap": 1, "quizCompletedMap": 1, "highestUnlockedId": 1},
+    ) or {}
+    passed_map = cp.get("quizPassedMap") or {}
+
+    highest_unlocked = cp.get("highestUnlockedId")
+    try:
+        highest_unlocked = int(highest_unlocked) if highest_unlocked is not None else None
+    except Exception:
+        highest_unlocked = None
+
+    # Decide video count.
+    # ✅ Admin requirement: always show ALL video titles (even if locked/unlocked).
+    # Prefer the full list from course_states when available.
+    pm_max = 0
+    try:
+        for k in (passed_map or {}).keys():
+            try:
+                pm_max = max(pm_max, int(k))
+            except Exception:
+                pass
+    except Exception:
+        pm_max = 0
+
+    attempts_max = 0
+    try:
+        attempts_max = max(by_video_no.keys()) if by_video_no else 0
+    except Exception:
+        attempts_max = 0
+
+    if video_list:
+        total_videos = len(video_list)
+    else:
+        total_videos = max(pm_max, attempts_max, len(video_urls), int(total_videos or 0))
+
+    rows = []
+    # Fill rows from 1..N so table doesn't come empty
+    N = int(total_videos) if total_videos else len(video_urls)
+    if N <= 0:
+        N = 0
+    for i in range(1, N + 1):
+        d = by_video_no.get(i)
+        link = video_urls[i - 1] if (video_urls and (i - 1) < len(video_urls)) else None
+        title = None
+        if video_list and (i - 1) < len(video_list):
+            title = (video_list[i - 1] or {}).get("title")
+
+        legacy_inferred = False
+        attempted = False
+        # Determine passed: prefer stored attempt doc; fallback to progress map (may contain false for failed)
+        passed = None
+        if d is not None and ("passed" in d):
+            passed = bool(d.get("passed"))
+            attempted = True
+        if passed is None:
+            key = str(i)
+            attempted = key in (passed_map or {})
+            if attempted:
+                try:
+                    passed = bool((passed_map or {}).get(key))
+                except Exception:
+                    passed = False
+            else:
+                # ✅ Legacy fallback (old courses): if marks/attempt docs aren't stored
+                # and quizPassedMap doesn't contain the early videos, infer passed
+                # based on highestUnlockedId.
+                # Example: highestUnlockedId=3 implies quizzes for Video 1 & 2 were passed.
+                legacy_inferred = False
+                if highest_unlocked is not None and i < highest_unlocked:
+                    attempted = True
+                    passed = True
+                    legacy_inferred = True
+                else:
+                    passed = False
+                    legacy_inferred = False
+
+        # attemptsUsed:
+        # 1) if stored attempt doc exists, use its attemptsUsed
+        # 2) else, use count of stored docs for that video
+        # 3) else, fallback to course_progress flags
+        attempts_used = (d.get("attemptsUsed") or d.get("attempts") or d.get("attemptCount")) if d else None
+        if attempts_used is None:
+            attempts_used = attempts_count.get(i)
+        if attempts_used is None:
+            # legacy course_progress often stores only boolean maps
+            key = str(i)
+            submitted_map = (cp.get("quizSubmittedMap") or {}) if isinstance(cp, dict) else {}
+            completed_map = (cp.get("quizCompletedMap") or {}) if isinstance(cp, dict) else {}
+            if key in (submitted_map or {}) or key in (completed_map or {}):
+                attempts_used = 1
+            elif highest_unlocked is not None and i < highest_unlocked:
+                attempts_used = 1
+            else:
+                attempts_used = 0
+
+        # whether this row has real stored marks
+        has_score = False
+        try:
+            has_score = (d is not None) and (d.get("lastScore") is not None) and (d.get("totalQuestions") is not None)
+        except Exception:
+            has_score = False
+
+        rows.append({
+            "uid": uid,
+            "courseTitle": course_title,
+            "videoNo": i,
+            "totalVideos": total_videos,
+            "videoTitle": (title or (d.get("videoTitle") if d else None) or f"Video {i}"),
+            "video_url": (d.get("video_url") if d else None) or link,
+            "quiz_id": d.get("quiz_id") if d else None,
+            "bestScore": (d.get("bestScore") or d.get("best") or d.get("best_score") or d.get("score") or d.get("marks") or d.get("lastScore")) if d else None,
+            "lastScore": (d.get("lastScore") or d.get("last") or d.get("last_score") or d.get("score") or d.get("marks")) if d else None,
+            "totalQuestions": (d.get("totalQuestions") or d.get("total") or d.get("max") or d.get("totalQ")) if d else None,
+            "required": d.get("required") if d else None,
+            "passed": bool(passed),
+            "attempted": bool(attempted),
+            "attemptsUsed": int(attempts_used or 0),
+            "hasScore": bool(has_score),
+            "legacyInferred": bool(legacy_inferred),
+            "lastAttemptAt": (d.get("lastAttemptAt") or d.get("updatedAt")) if d else None,
+            "updatedAt": d.get("updatedAt") if d else None,
+        })
+
+    return jsonify({
+        "ok": True,
+        "rows": rows,
+        "meta": {"uid": uid, "courseTitle": course_title, "totalVideos": total_videos}
+    })
+
+@app.get("/admin/user/<uid>/mocktests")
+def admin_user_mocktests(uid):
+    """Recent mock test sessions for a single user."""
+    _, err = require_admin()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    db = get_db()
+    col = _mocktest_sessions_col(db)
+
+    docs = list(col.find({"uid": uid}, projection={"_id": 0}).sort("created_at", -1).limit(200))
+
+    out = []
+    for d in docs:
+        total_score = d.get("total_score")
+        total_marks = d.get("total_marks")
+        score_percent = None
+        try:
+            if total_score is not None and total_marks:
+                score_percent = (float(total_score) / float(total_marks)) * 100.0
+        except Exception:
+            score_percent = None
+
+        submitted_at = d.get("submittedAt") or d.get("submitted_at")
+        status = (d.get("status") or "").lower()
+        if submitted_at is None and status == "submitted":
+            submitted_at = d.get("updated_at")
+
+        passed = None
+        if score_percent is not None:
+            passed = bool(score_percent >= 60.0)
+
+        out.append({
+            "sessionId": d.get("session_id") or d.get("sessionId") or d.get("_id"),
+            "mode": d.get("mode") or "unknown",
+            "createdAt": d.get("created_at") or d.get("createdAt"),
+            "submittedAt": submitted_at,
+            "scorePercent": score_percent,
+            "passed": bool(passed) if passed is not None else False,
+        })
+
+    return jsonify({"ok": True, "rows": out})
+
+
+@app.get("/admin/user/<uid>/mocktests/<session_id>")
+def admin_user_mocktest_detail(uid, session_id):
+    """Full detail for a single mock test session (scores + analysis)."""
+    _, err = require_admin()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    db = get_db()
+    col = _mocktest_sessions_col(db)
+    doc = col.find_one({"uid": uid, "session_id": session_id}, projection={"_id": 0})
+    if not doc:
+        # fallback: some older docs used sessionId
+        doc = col.find_one({"uid": uid, "sessionId": session_id}, projection={"_id": 0})
+    if not doc:
+        return jsonify({"ok": False, "error": "Not found"}), 404
+
+    # Keep payload compact: don't send full hidden tests.
+    out = {
+        "sessionId": doc.get("session_id") or doc.get("sessionId") or session_id,
+        "title": doc.get("title") or "Mock Test",
+        "mode": doc.get("mode") or "unknown",
+        "pattern": doc.get("pattern") or {},
+        "status": doc.get("status") or "",
+        "createdAt": doc.get("created_at") or doc.get("createdAt"),
+        "submittedAt": doc.get("submittedAt") or doc.get("submitted_at"),
+        "scores": doc.get("scores") or {},
+        "total_score": doc.get("total_score"),
+        "total_marks": doc.get("total_marks"),
+        "coding_total_marks": doc.get("coding_total_marks") or doc.get("coding_total_marks"),
+        "coding_details": doc.get("coding_details") or {},
+        "analysis": doc.get("analysis"),
+        "updatedAt": doc.get("updated_at") or doc.get("updatedAt"),
+    }
+
+    return jsonify({"ok": True, "session": out})
+
+
+@app.get("/admin/course/<course_title>/summary")
+def admin_course_summary(course_title):
+    """Course drilldown summary."""
+    _, err = require_admin()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    db = get_db()
+    ct = (course_title or "").strip()
+    if not ct:
+        return jsonify({"ok": False, "error": "Missing courseTitle"}), 400
+
+    # users studying = distinct uid in course_states
+    studying_uids = list(db.course_states.aggregate([
+        {"$match": {"courseTitle": ct}},
+        {"$group": {"_id": "$uid"}},
+    ]))
+    users_studying = len(studying_uids)
+
+    users_on_hold = db.course_holds.count_documents({"courseTitle": ct, "held": True})
+
+    # progress stats
+    cps = list(db.course_progress.find({"courseTitle": ct}, projection={"_id": 0, "quizPassedMap": 1}))
+
+    def count_true(dct):
+        if not isinstance(dct, dict):
+            return 0
+        return sum(1 for _, v in dct.items() if bool(v))
+
+    passed_total = sum(count_true(x.get("quizPassedMap") or {}) for x in cps)
+
+    return jsonify({
+        "ok": True,
+        "courseTitle": ct,
+        "usersStudying": int(users_studying),
+        "usersOnHold": int(users_on_hold),
+        "progressDocs": len(cps),
+        "passedQuizCount": int(passed_total),
+    })
+
+
+@app.get("/admin/course/<course_title>/progress")
+def admin_course_progress_detail(course_title):
+    """User progress rows for a given course."""
+    _, err = require_admin()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    db = get_db()
+    ct = (course_title or "").strip()
+    if not ct:
+        return jsonify({"ok": False, "error": "Missing courseTitle"}), 400
+
+    # total quizzes per course derived from course_states
+    def count_videos(obj):
+        if obj is None:
+            return 0
+        if isinstance(obj, list):
+            return sum(count_videos(it) for it in obj)
+        if isinstance(obj, dict):
+            if isinstance(obj.get("videos"), list):
+                return len(obj.get("videos"))
+            if "video" in obj and ("topic" in obj or "title" in obj):
+                return 1
+            return sum(count_videos(v) for v in obj.values())
+        return 0
+
+    total = 0
+    for st in db.course_states.find({"courseTitle": ct}, projection={"_id": 0, "videos": 1}):
+        total = max(total, count_videos(st.get("videos")))
+
+    def count_true(dct):
+        if not isinstance(dct, dict):
+            return 0
+        return sum(1 for _, v in dct.items() if bool(v))
+
+    users = {u["uid"]: u for u in db.users.find({}, projection={"_id": 0, "uid": 1, "email": 1, "name": 1})}
+
+    rows = []
+    for cp in db.course_progress.find({"courseTitle": ct}, projection={"_id": 0, "uid": 1, "quizPassedMap": 1, "updatedAt": 1}):
+        uid = cp.get("uid")
+        u = users.get(uid) or {}
+        passed = count_true(cp.get("quizPassedMap") or {})
+        pct = int(round((passed / total) * 100)) if total else 0
+        rows.append({
+            "uid": uid,
+            "name": u.get("name"),
+            "email": u.get("email"),
+            "courseTitle": ct,
+            "totalQuizzes": int(total),
+            "passedQuizzes": int(passed),
+            "percent": pct,
+            "held": is_course_held(uid, ct),
+            "updatedAt": cp.get("updatedAt"),
+        })
+
+    rows.sort(key=lambda x: (x.get("held") is False, x.get("percent") or 0), reverse=True)
+    return jsonify({"ok": True, "rows": rows})
+
+
+@app.get("/admin/course/<course_title>/quiz-attempts")
+def admin_course_quiz_attempts(course_title):
+    """Per-video quiz attempt summaries for a course (across users)."""
+    _, err = require_admin()
+    if err:
+        msg, code = err
+        return jsonify({"error": msg}), code
+
+    ct = (course_title or "").strip()
+    if not ct:
+        return jsonify({"ok": False, "error": "Missing courseTitle"}), 400
+
+    db = get_db()
+    docs = list(
+        db.quiz_attempts.find({"courseTitle": ct}, projection={"_id": 0})
+        .sort([("videoNo", 1), ("lastAttemptAt", -1)])
+        .limit(5000)
+    )
+
+    uids = sorted({d.get("uid") for d in docs if d.get("uid")})
+    users = {}
+    if uids:
+        for u in db.users.find({"uid": {"$in": uids}}, projection={"_id": 0, "uid": 1, "name": 1, "email": 1}):
+            users[u.get("uid")] = {"name": u.get("name"), "email": u.get("email")}
+
+    rows = []
+    for d in docs:
+        uid = d.get("uid")
+        u = users.get(uid) or {}
+        rows.append({
+            "uid": uid,
+            "name": u.get("name"),
+            "email": u.get("email"),
+            "courseTitle": d.get("courseTitle"),
+            "videoNo": d.get("videoNo"),
+            "totalVideos": d.get("totalVideos"),
+            "lastScore": d.get("lastScore"),
+            "bestScore": d.get("bestScore"),
+            "totalQuestions": d.get("totalQuestions"),
+            "required": d.get("required"),
+            "passed": bool(d.get("passed")),
+            "attemptsUsed": d.get("attemptsUsed"),
+            "lastAttemptAt": d.get("lastAttemptAt") or d.get("updatedAt"),
+            "video_url": d.get("video_url"),
+        })
+
+    return jsonify({"ok": True, "rows": rows})
+
+# - mocktest_sessions: one doc per test session (questions + results + analysis)
+
+def _mocktest_sessions_col(db):
+    return db.mocktest_sessions
+
+# Judge0
+# NOTE: RapidAPI endpoint requires headers; most self-host/public instances do not.
+# Default to the official public CE instance so coding works out-of-the-box.
+_JUDGE0_BASE_URL = (os.getenv("JUDGE0_BASE_URL") or "https://ce.judge0.com").rstrip("/")
+_JUDGE0_RAPIDAPI_KEY = (os.getenv("JUDGE0_RAPIDAPI_KEY") or "").strip()
+_JUDGE0_RAPIDAPI_HOST = (os.getenv("JUDGE0_RAPIDAPI_HOST") or "").strip()
+
+# Judge0 language IDs (Judge0 CE common IDs; can differ by deployment)
+# https://ce.judge0.com/#languages (verify for your instance)
+_JUDGE0_LANG_IDS = {
+    "c": 50,
+    "cpp": 54,
+    "c++": 54,
+    "java": 62,
+    "python": 71,
+    "python3": 71,
+}
+
+def _judge0_headers():
+    h = {"Content-Type": "application/json"}
+    # RapidAPI style headers (optional)
+    if _JUDGE0_RAPIDAPI_KEY:
+        h["X-RapidAPI-Key"] = _JUDGE0_RAPIDAPI_KEY
+    if _JUDGE0_RAPIDAPI_HOST:
+        h["X-RapidAPI-Host"] = _JUDGE0_RAPIDAPI_HOST
+    return h
+
+def _judge0_run(source_code: str, stdin: str, language: str, expected: str = None, time_limit: float = None):
+    """Run code on Judge0 and return dict with stdout/stderr/status. If expected provided, include pass bool."""
+    lang_key = (language or "").strip().lower()
+    lang_id = _JUDGE0_LANG_IDS.get(lang_key)
+    if not lang_id:
+        raise ValueError(f"Unsupported language: {language}. Allowed: Java, C, C++, Python")
+
+    payload = {
+        "language_id": lang_id,
+        "source_code": source_code or "",
+        "stdin": stdin or "",
+        # Optional knobs: keep defaults unless needed
+        "redirect_stderr_to_stdout": False,
+    }
+
+    # Judge0 CE supports per-submission time limits; RapidAPI proxy usually supports it too.
+    # Only set when provided to avoid incompat issues across deployments.
+    if time_limit is not None:
+        payload["cpu_time_limit"] = float(time_limit)
+
+    url = f"{_JUDGE0_BASE_URL}/submissions?base64_encoded=false&wait=true"
+    r = requests.post(url, headers=_judge0_headers(), json=payload, timeout=60)
+    r.raise_for_status()
+    out = r.json() or {}
+
+    stdout = (out.get("stdout") or "").strip()
+    stderr = (out.get("stderr") or "").strip()
+    compile_out = (out.get("compile_output") or "").strip()
+    status = (out.get("status") or {}) or {}
+    status_id = status.get("id")
+    status_desc = status.get("description")
+
+    res = {
+        "stdout": stdout,
+        "stderr": stderr,
+        "compile_output": compile_out,
+        "status_id": status_id,
+        "status": status_desc,
+        "time": out.get("time"),
+        "memory": out.get("memory"),
+    }
+    if expected is not None:
+        exp = (expected or "").strip()
+        res["expected"] = exp
+        res["passed"] = (stdout.strip() == exp.strip()) and (not stderr) and (not compile_out) and (status_id in [3])  # 3 = Accepted
+    return res
+
+# Piston (free code runner) fallback - works without API keys
+_PISTON_BASE_URL = (os.getenv("PISTON_BASE_URL") or "http://127.0.0.1:2000/api/v2").rstrip("/")
+
+# Optional auth token (mainly for hosted / public Piston instances).
+# If set, it will be sent as the Authorization header value.
+# Example: "Bearer <token>" (depends on your provider).
+_PISTON_AUTH = (os.getenv("PISTON_AUTH") or "").strip()
+
+def _piston_headers():
+    h = {}
+    if _PISTON_AUTH:
+        h["Authorization"] = _PISTON_AUTH
+    return h
+
+
+# Optional Sphere Engine support (if you have credentials)
+# Set SPHERE_ENGINE_ENDPOINT like: https://<your-subdomain>.compilers.sphere-engine.com
+# Set SPHERE_ENGINE_TOKEN to your access token
+_SPHERE_ENGINE_ENDPOINT = (os.getenv("SPHERE_ENGINE_ENDPOINT") or "").rstrip("/")
+_SPHERE_ENGINE_TOKEN = (os.getenv("SPHERE_ENGINE_TOKEN") or "").strip()
+
+_SPHERE_LANG = {
+    "python": "python",
+    "python3": "python",
+    "java": "java",
+    "c": "c",
+    "cpp": "cpp",
+    "c++": "cpp",
+}
+
+_PISTON_LANG = {
+    "python": "python",
+    "python3": "python",
+    "java": "java",
+    "c": "c",
+    "cpp": "cpp",
+    "c++": "cpp",
+}
+
+def _piston_run(source_code: str, stdin: str, language: str, expected: str = None, time_limit: float = None):
+    lang_key = (language or "").strip().lower()
+    lang = _PISTON_LANG.get(lang_key)
+    if not lang:
+        raise ValueError(f"Unsupported language: {language}. Allowed: Java, C, C++, Python")
+
+    url = f"{_PISTON_BASE_URL}/execute"
+    payload = {
+        "language": lang,
+        "version": "*",
+        "files": [{"content": source_code or ""}],
+        "stdin": stdin or "",
+    }
+    r = requests.post(url, headers=_piston_headers(), json=payload, timeout=60)
+    # Helpful error for common misconfigurations (401 / wrong base path)
+    if r.status_code == 401:
+        raise RuntimeError(
+            "Piston returned 401 Unauthorized. If you're using the public emkc.org Piston, it now requires an auth token. "
+            "Set PISTON_AUTH (e.g., 'Bearer <token>') and PISTON_BASE_URL accordingly, or use your self-hosted Piston (recommended)."
+        )
+    r.raise_for_status()
+    out = r.json() or {}
+
+    run = out.get("run") or {}
+    stdout = (run.get("stdout") or "").strip()
+    stderr = (run.get("stderr") or "").strip()
+
+    res = {
+        "stdout": stdout,
+        "stderr": stderr,
+        "compile_output": "",
+        "status_id": 3 if not stderr else 11,
+        "status": "Accepted" if not stderr else "Runtime Error",
+        "time": run.get("time"),
+        "memory": run.get("memory"),
+    }
+    if expected is not None:
+        exp = (expected or "").strip()
+        res["expected"] = exp
+        res["passed"] = (stdout.strip() == exp.strip()) and (not stderr)
+    return res
+
+def _sphere_engine_run(source_code: str, stdin: str, language: str, expected: str = None, time_limit: float = None):
+    if not _SPHERE_ENGINE_ENDPOINT or not _SPHERE_ENGINE_TOKEN:
+        raise RuntimeError("Sphere Engine is not configured")
+
+    lang_key = (language or "").strip().lower()
+    lang = _SPHERE_LANG.get(lang_key)
+    if not lang:
+        raise ValueError(f"Unsupported language: {language}. Allowed: Java, C, C++, Python")
+
+    # Sphere Engine Compilers API uses problem id / compiler id depending on plan.
+    # Since setups vary, we keep Sphere optional and recommend using Piston by default.
+    raise RuntimeError("Sphere Engine integration placeholder: configure compiler IDs for your account")
+
+
+def _estimate_complexity(source_code: str, language: str):
+    """Very lightweight complexity estimator (heuristic).
+    Users can override by adding a comment like: '# O(n log n), O(1)' or '// O(n), O(n)'.
+    """
+    code = source_code or ""
+
+    # Explicit hint
+    for line in code.splitlines()[:40]:
+        if "O(" in line:
+            parts = re.findall(r'O\([^\)]*\)', line)
+            if len(parts) >= 2:
+                return {"estimated_time": parts[0], "estimated_space": parts[1], "notes": "From inline hint in code comments."}
+            if len(parts) == 1:
+                return {"estimated_time": parts[0], "estimated_space": "O(1)", "notes": "From inline hint in code comments."}
+
+    lower = code.lower()
+
+    # Crude nesting estimate
+    nest = 0
+    cur = 0
+    for raw in code.splitlines():
+        line = raw.strip().lower()
+        if line.startswith(("for ", "while ")):
+            cur += 1
+            nest = max(nest, cur)
+        # naive close on braces/return
+        if line == "}" or line.startswith("return"):
+            cur = max(0, cur - 1)
+
+    has_sort = ("sort" in lower) or ("sorted(" in lower)
+    uses_hash = any(k in lower for k in ["dict", "hashmap", "unordered_map", "set<", "hashset", "map<"])
+    uses_heap = ("heapq" in lower) or ("priorityqueue" in lower) or ("priority_queue" in lower)
+
+    if nest >= 2:
+        t = "O(n^2)"
+    elif nest == 1 and has_sort:
+        t = "O(n log n)"
+    elif nest == 1:
+        t = "O(n)"
+    else:
+        t = "O(1)" if not has_sort else "O(n log n)"
+
+    s = "O(n)" if (uses_hash or uses_heap) else "O(1)"
+    return {"estimated_time": t, "estimated_space": s, "notes": "Heuristic estimate. Add an 'O(...)' comment to override."}
+
+def _code_run(source_code: str, stdin: str, language: str, expected: str = None, time_limit: float = None):
+    """Robust code runner: try Judge0 first, then Piston as fallback."""
+    last = None
+    try:
+        return _judge0_run(source_code, stdin, language, expected=expected, time_limit=time_limit)
+    except Exception as e:
+        last = e
+
+    try:
+        return _piston_run(source_code, stdin, language, expected=expected, time_limit=time_limit)
+    except Exception as e:
+        last = e
+
+    raise last or RuntimeError("Code runner failed")
+
+
+def _mocktest_generate_apti_questions(section: str, n: int, difficulty: str = "mixed"):
+    """Generate aptitude questions using Gemini and self-verify with Gemini."""
+    n = int(n or 0)
+    if n <= 0:
+        return []
+
+    section = (section or "").strip().lower()
+    if section not in ["general", "tech"]:
+        section = "general"
+
+    # Expose a 'subsection' field to support UI section menus.
+    if section == "general":
+        focus = "General Aptitude (company screening)"
+        subsections = ["Quant", "Logical", "Verbal"]
+        topics = "Percentages, Ratios, Time & Work, Time & Distance, Profit & Loss, Probability basics, Puzzles, Syllogisms, Reading comprehension short, Error spotting"
+    else:
+        focus = "Technical Aptitude (company screening)"
+        subsections = ["DSA", "OOP", "OS", "CN", "DBMS"]
+        topics = "Big-O, arrays/strings, stacks/queues, hashing, trees basics, OOP principles, threading basics, OS processes vs threads, deadlock, TCP/UDP, HTTP basics, normalization, indexing"
+
+    recent_qs = list(RECENT_MCQ_HASHES)[-60:]
+    prompt = f"""
+You are generating aptitude multiple-choice questions for a mock test.
+
+Return STRICT JSON only (no markdown), schema:
+{{
+  "questions": [
+    {{
+      "id": "Q1",
+      "section": "{section}",
+      "subsection": "{subsections[0]}",
+      "difficulty": "{difficulty}",
+      "topic": "...",
+      "question": "...",
+      "options": ["A ...","B ...","C ...","D ..."],
+      "correctIndex": 0,
+      "answerText": "A ...",
+      "explanation": "1-2 lines"
+    }}
+  ]
+}}
+
+Rules:
+- Avoid repeating any of these recent questions (do NOT reuse wording/hardly similar): {recent_qs}
+- Generate exactly {n} questions.
+- Each question must have 4 options only.
+- correctIndex must be 0-3 and must match answerText.
+- subsection must be one of: {subsections}.
+- Avoid ambiguous questions. Use precise numerical values.
+- 1 mark per question.
+- Topic coverage: {topics}.
+"""
+
+    obj = _gemini_json(prompt) or {}
+    qs = obj.get("questions") if isinstance(obj, dict) else None
+    if not isinstance(qs, list):
+        qs = []
+
+    # Verification pass (Gemini: verify correctIndex consistency)
+    verify_prompt = f"""
+You will be given aptitude MCQ questions as JSON.
+Verify each question has exactly 4 options, correctIndex 0-3, and answerText matches the option at correctIndex.
+If any is wrong, fix it.
+Return STRICT JSON with the same schema: {{ "questions": [ ... ] }} only.
+
+INPUT JSON:
+{json.dumps({"questions": qs}, ensure_ascii=False)}
+"""
+    verified = _gemini_json(verify_prompt) or {}
+    vqs = verified.get("questions") if isinstance(verified, dict) else None
+    if isinstance(vqs, list) and len(vqs) == len(qs):
+        qs = vqs
+
+    # --- Fallback bank ---
+    # Gemini can occasionally return empty/invalid output. Ensure we ALWAYS return n MCQs.
+    if not qs:
+        if section == "general":
+            bank = [
+                {
+                    "subsection": "Quant",
+                    "topic": "Percentages",
+                    "question": "If the price of an item increases by 20% and then decreases by 20%, what is the net change?",
+                    "options": ["0%", "4% decrease", "4% increase", "20% decrease"],
+                    "correctIndex": 1,
+                    "explanation": "Take 100 → 120 → 96, net 4% decrease.",
+                },
+                {
+                    "subsection": "Quant",
+                    "topic": "Time & Work",
+                    "question": "A can do a job in 10 days and B can do it in 15 days. In how many days can they finish together?",
+                    "options": ["5", "6", "7", "8"],
+                    "correctIndex": 1,
+                    "explanation": "Rate = 1/10 + 1/15 = 1/6.",
+                },
+                {
+                    "subsection": "Logical",
+                    "topic": "Syllogism",
+                    "question": "Statements: All pens are blue. Some blue are costly. Conclusions: (1) Some pens are costly. (2) All costly are pens.\\nWhich conclusion follows?",
+                    "options": ["Only 1", "Only 2", "Both", "Neither"],
+                    "correctIndex": 3,
+                    "explanation": "No guarantee costly intersects pens; costly→pens not given.",
+                },
+                {
+                    "subsection": "Verbal",
+                    "topic": "Error spotting",
+                    "question": "Choose the correct sentence:",
+                    "options": ["He don't like coffee.", "He doesn't likes coffee.", "He doesn't like coffee.", "He didn't likes coffee."],
+                    "correctIndex": 2,
+                    "explanation": "With does/doesn't use base verb form.",
+                },
+                {
+                    "subsection": "Logical",
+                    "topic": "Calendar",
+                    "question": "If today is Wednesday, what day will it be after 10 days?",
+                    "options": ["Saturday", "Sunday", "Monday", "Tuesday"],
+                    "correctIndex": 0,
+                    "explanation": "10 mod 7 = 3; Wed + 3 = Saturday.",
+                },
+            ]
+        else:
+            bank = [
+                {
+                    "subsection": "DSA",
+                    "topic": "Big-O",
+                    "question": "What is the time complexity of binary search on a sorted array of size n?",
+                    "options": ["O(n)", "O(log n)", "O(n log n)", "O(1)"],
+                    "correctIndex": 1,
+                    "explanation": "Each step halves the search space.",
+                },
+                {
+                    "subsection": "OOP",
+                    "topic": "Polymorphism",
+                    "question": "Which OOP concept allows the same interface to represent different underlying forms?",
+                    "options": ["Encapsulation", "Abstraction", "Inheritance", "Polymorphism"],
+                    "correctIndex": 3,
+                    "explanation": "Polymorphism enables one interface, many implementations.",
+                },
+                {
+                    "subsection": "OS",
+                    "topic": "Processes",
+                    "question": "Which is true about a process vs a thread?",
+                    "options": ["Threads have separate address spaces", "Processes share the same address space", "Threads share a process address space", "Processes cannot have multiple threads"],
+                    "correctIndex": 2,
+                    "explanation": "Threads within a process share address space/resources.",
+                },
+                {
+                    "subsection": "CN",
+                    "topic": "TCP/UDP",
+                    "question": "Which protocol is connection-oriented?",
+                    "options": ["UDP", "TCP", "IP", "ICMP"],
+                    "correctIndex": 1,
+                    "explanation": "TCP establishes a connection (3-way handshake).",
+                },
+                {
+                    "subsection": "DBMS",
+                    "topic": "Normalization",
+                    "question": "Which normal form removes partial dependency?",
+                    "options": ["1NF", "2NF", "3NF", "BCNF"],
+                    "correctIndex": 1,
+                    "explanation": "2NF removes partial dependency on a candidate key.",
+                },
+            ]
+
+        qs = []
+        for i in range(n):
+            b = dict(bank[i % len(bank)])
+            b["id"] = f"{section.upper()}-{i+1}"
+            b["section"] = section
+            b["difficulty"] = difficulty
+            b["answerText"] = b["options"][int(b.get("correctIndex") or 0)]
+            qs.append(b)
+
+    # Normalize ids
+    out = []
+    for i, q in enumerate(qs, start=1):
+        if not isinstance(q, dict):
+            continue
+        opts = q.get("options") or []
+        if not isinstance(opts, list) or len(opts) != 4:
+            continue
+        ci = q.get("correctIndex")
+        try:
+            ci = int(ci)
+        except Exception:
+            ci = 0
+        if ci < 0 or ci > 3:
+            ci = 0
+        out.append({
+            "id": q.get("id") or f"{section.upper()}-{i}",
+            "section": section,
+            "subsection": q.get("subsection") or "",
+            "difficulty": q.get("difficulty") or difficulty,
+            "topic": q.get("topic") or "",
+            "question": q.get("question") or "",
+            "options": opts,
+            "correctIndex": ci,
+            "answerText": q.get("answerText") or opts[ci],
+            "explanation": q.get("explanation") or "",
+            "marks": 1,
+        })
+    return out
+
+
+def _default_starter_code() -> dict:
+    return {
+        "python": "import sys\n\ndef solve():\n    data = sys.stdin.read().strip().split()\n    # TODO: parse input and implement\n    # print(result)\n    return\n\nif __name__ == '__main__':\n    solve()\n",
+        "java": "import java.io.*;\nimport java.util.*;\n\npublic class Main {\n  static void solve(FastScanner fs, StringBuilder out) throws Exception {\n    // TODO: implement\n  }\n\n  public static void main(String[] args) throws Exception {\n    FastScanner fs = new FastScanner(System.in);\n    StringBuilder out = new StringBuilder();\n    solve(fs, out);\n    System.out.print(out.toString());\n  }\n\n  static class FastScanner {\n    private final InputStream in;\n    private final byte[] buffer = new byte[1 << 16];\n    private int ptr = 0, len = 0;\n    FastScanner(InputStream is){ in=is; }\n    private int read() throws IOException {\n      if (ptr >= len) {\n        len = in.read(buffer);\n        ptr = 0;\n        if (len <= 0) return -1;\n      }\n      return buffer[ptr++];\n    }\n    String next() throws IOException {\n      StringBuilder sb = new StringBuilder();\n      int c;\n      while ((c = read()) != -1 && c <= ' ') {}\n      if (c == -1) return null;\n      do { sb.append((char)c); } while ((c = read()) != -1 && c > ' ');\n      return sb.toString();\n    }\n    Integer nextInt() throws IOException {\n      String s = next();\n      return s == null ? null : Integer.parseInt(s);\n    }\n  }\n}\n",
+        "c": "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\nint main(void) {\n    // TODO: read input from stdin and implement\n    // printf(\"%d\\n\", ans);\n    return 0;\n}\n",
+        "cpp": "#include <bits/stdc++.h>\nusing namespace std;\n\nint main(){\n  ios::sync_with_stdio(false);\n  cin.tie(nullptr);\n\n  // TODO: parse input and implement\n\n  return 0;\n}\n"
+    }
+
+
+def _merge_starter_code(model_value) -> dict:
+    """Merge model-provided starterCode with defaults.
+
+    UI expects keys: python, java, c, cpp.
+    """
+    defaults = _default_starter_code()
+    if not model_value:
+        return defaults
+    if isinstance(model_value, str):
+        s = model_value.strip()
+        if s:
+            defaults["python"] = s
+        return defaults
+    if not isinstance(model_value, dict):
+        return defaults
+
+    norm = {}
+    for k, v in model_value.items():
+        if not isinstance(v, str) or not v.strip():
+            continue
+        kk = str(k).strip().lower()
+        if kk in ("py", "python3"):
+            kk = "python"
+        if kk in ("c++", "cpp17", "c++17", "cplusplus", "cxx"):
+            kk = "cpp"
+        if kk in ("c", "java", "python", "cpp"):
+            norm[kk] = v
+
+    defaults.update(norm)
+    return defaults
+
+
+def _mocktest_generate_coding_problems(n: int, difficulty: str = "mixed"):
+    """Generate DSA coding problems + hidden tests + python reference solution, and validate reference via Judge0.
+
+    Expected model output (STRICT JSON):
+    { "problems": [ ... ] }
+    """
+    n = int(n or 0)
+    if n <= 0:
+        return []
+
+    difficulty = (difficulty or "mixed").strip().lower()
+    if difficulty not in ["easy", "mixed", "medium", "hard"]:
+        difficulty = "mixed"
+
+
+    # ✅ Total testcases per problem by difficulty (user requirement):
+    # Easy: 15 (5 sample + 10 hidden)
+    # Medium: 20 (5 sample + 15 hidden)
+    # Hard: 25 (5 sample + 20 hidden)
+    total_tests_map = {"easy": 15, "medium": 20, "hard": 25, "mixed": 20}
+    want_total = int(total_tests_map.get(difficulty, 8))
+    want_samples = 5
+    want_hidden = max(0, want_total - want_samples)
+
+    # prompt-level dedupe: ask model to avoid recently used titles
+    avoid_titles = list(RECENT_CODING_TITLES)[-50:]
+
+    prompt = (
+        "You are generating coding problems for a mock test platform.\n"
+        "Return STRICT JSON ONLY. No markdown.\n\n"
+        "Return JSON with key 'problems' (array). Each problem must include: id/slug, title, difficulty (easy|medium|hard), topics (array), statement, inputFormat, outputFormat, constraints (array), starterCode (python/java/cpp) [UNSOLVED TEMPLATE ONLY - no working solution; include only skeleton + input reading + TODO comments], solutionHint, tests.\n\n"
+        f"COMPLEXITY: Also include 'timeComplexity' and 'spaceComplexity' as Big-O strings (e.g., \"O(n log n)\", \"O(1)\").\n"
+        f"TESTS: Provide EXACTLY {want_total} tests per problem in 'tests'. You MUST provide {want_samples} sample tests (isSample=true) and the remaining {want_hidden} tests must be hidden (isSample=false). Total tests must be {want_total} ({want_samples} sample + {want_hidden} hidden).\n"
+        "CRITICAL: All testcases must be UNIQUE. Do NOT repeat the same input (even with different spacing/newlines). Hidden tests MUST NOT duplicate any sample test. If you are struggling, create new edge-case variations, but never repeat an input.\n"
+        "Each test item: {stdin, expected, isSample}.\n"
+        "expected must match exact output. Include edge cases.\n\n"
+        + (f"Avoid repeating any of these titles (do NOT reuse): {avoid_titles}.\n" if avoid_titles else "")
+        + f"Generate {n} problems.\n"
+    )
+
+
+    # IMPORTANT: If Gemini fails, do NOT use local fallbacks.
+    # Retry Gemini a few times; if it still fails, raise so the client can ask the user to regenerate.
+    probs = []
+    last_err = None
+    for _attempt in range(1, 5):  # up to 4 attempts
+        try:
+            obj = _gemini_json(prompt) or {}
+            probs = obj.get("problems") if isinstance(obj, dict) else None
+            if not isinstance(probs, list):
+                probs = []
+            if probs:
+                last_err = None
+                break
+        except Exception as e:
+            last_err = e
+            probs = []
+
+    if not probs:
+        raise RuntimeError(f"Gemini failed to generate coding problems. Please regenerate. Details: {last_err}")
+
+    def _coding_full_marks(diff: str) -> int:
+        d = (diff or "").strip().lower()
+        if d == "easy":
+            return 15
+        if d == "medium":
+            return 20
+        if d in ["hard", "difficult"]:
+            return 25
+        # mixed/unknown
+        return 20
+
+    out = []
+    for i, p in enumerate(probs, start=1):
+        if not isinstance(p, dict):
+            continue
+
+        # Accept tests in multiple formats.
+
+        tests = p.get('tests') or p.get('testcases') or []
+
+        samples = []
+
+        hid = []
+
+        if isinstance(tests, list) and tests:
+
+            tagged_samples = [t for t in tests if isinstance(t, dict) and t.get('isSample') is True]
+
+            tagged_hidden = [t for t in tests if isinstance(t, dict) and t.get('isSample') is False]
+
+            if tagged_samples or tagged_hidden:
+
+                samples = tagged_samples[:4]
+
+                # ✅ Don't truncate hidden tests here.
+                # We'll decide the final hidden count later (based on difficulty),
+                # and we will enforce uniqueness so hidden never repeats sample inputs.
+                hid = tagged_hidden
+
+            else:
+
+                samples = [t for t in tests[:4] if isinstance(t, dict)]
+
+                hid = [t for t in tests[4:8] if isinstance(t, dict)]
+
+        else:
+
+            samples = p.get('samples') or []
+
+            hid = p.get('hiddenTests') or []
+
+        if not isinstance(samples, list): samples = []
+
+        if not isinstance(hid, list): hid = []
+
+        if len(samples) > 4:
+
+            hid = (hid or []) + samples[4:]
+
+            samples = samples[:4]
+
+        samples = samples[:4]
+
+        # Keep all hidden candidates for now; we'll decide final counts later.
+
+        # If hidden tests are missing, we will regenerate them later.
+
+        # Hard guarantee: always expose 4 sample tests and 11 hidden tests (total 15)
+        # so the frontend never shows "no hidden tests configured".
+        # If Gemini returns fewer tests, we pad by repeating existing ones.
+        # Ensure at least 1 non-empty sample so UI never shows blank sample boxes.
+        # Prefer promoting a hidden test to a sample if samples are missing/invalid.
+        def _tc_valid(tc: dict) -> bool:
+            if not isinstance(tc, dict):
+                return False
+            s = str(tc.get("stdin", "")).strip()
+            # expected can be empty for some problems, but stdin must be present
+            return len(s) > 0
+
+        # drop empty samples
+        samples = [x for x in samples if _tc_valid(x)]
+        hid = [x for x in hid if _tc_valid(x)]
+
+        if len(samples) == 0:
+            if len(hid) > 0:
+                # promote first hidden to sample
+                samples = [hid.pop(0)]
+            else:
+                # last-resort fallback (non-empty stdin)
+                samples = [{'stdin': '1\n', 'expected': ''}] 
+
+        # normalize keys
+        def _norm_tc(tc: dict) -> dict:
+            if not isinstance(tc, dict):
+                return {'stdin': '', 'expected': ''}
+            return {
+                'stdin': str(tc.get('stdin', '')),
+                'expected': str(tc.get('expected', '')),
+            }
+
+        samples = [_norm_tc(x) for x in samples]
+        hid = [_norm_tc(x) for x in hid]
+        # Decide sample/hidden split
+        # Requirement: difficulty-based totals (easy=8, medium=15, hard=20) with 4 samples.
+        want_samples = 4
+        total_tests_map = {"easy": 8, "medium": 15, "hard": 20, "mixed": 15}
+        want_total = int(total_tests_map.get(difficulty, 8))
+
+        # Build a compact problem text for testcase regeneration prompts.
+        try:
+            _cons = p.get('constraints') if isinstance(p.get('constraints'), list) else []
+            problem_text = (
+                f"{p.get('title') or ''}\n"
+                f"{p.get('statement') or ''}\n\n"
+                f"Input Format:\n{p.get('inputFormat') or ''}\n\n"
+                f"Output Format:\n{p.get('outputFormat') or ''}\n\n"
+                f"Constraints:\n" + "\n".join([str(x) for x in _cons])
+            )
+        except Exception:
+            problem_text = (p.get('statement') or '')
+        want_hidden = max(0, want_total - want_samples)
+
+        # Ensure 4 samples: if short, promote hidden; else last-resort duplicate the first sample.
+        while len(samples) < want_samples and len(hid) > 0:
+            samples.append(hid.pop(0))
+        while len(samples) < want_samples:
+            samples.append(dict(samples[0]))
+
+        samples = samples[:want_samples]
+
+        # ✅ Ensure hidden testcases are UNIQUE (avoid duplicates across samples/hidden).
+        # IMPORTANT: uniqueness is based on INPUT only (stdin), not expected output.
+        def _tc_key(tc):
+            try:
+                raw_in = str((tc or {}).get("stdin") or "")
+                # Normalize newlines then collapse all whitespace to single spaces.
+                s = raw_in.replace("\r\n", "\n").replace("\r", "\n")
+                s = " ".join(s.strip().split())
+                return s
+            except Exception:
+                return ""
+
+        seen_inputs = set()
+        uniq_samples = []
+        for tc in samples:
+            if not isinstance(tc, dict):
+                continue
+            k = _tc_key(tc)
+            if not k or k in seen_inputs:
+                continue
+            seen_inputs.add(k)
+            uniq_samples.append(tc)
+        samples = uniq_samples[:want_samples]
+
+        uniq_hid = []
+        for tc in hid:
+            if not isinstance(tc, dict):
+                continue
+            k = _tc_key(tc)
+            if not k or k in seen_inputs:
+                continue
+            seen_inputs.add(k)
+            uniq_hid.append(tc)
+        hid = uniq_hid
+
+        need_hidden = max(0, want_hidden - len(hid))
+        regen_attempts = 0
+        while need_hidden > 0 and regen_attempts < 3:
+            regen_attempts += 1
+            avoid_list = [x for x in list(seen_inputs) if x][:80]
+            regen_prompt = f"""You are generating additional HIDDEN testcases for this coding problem.
+
+Problem:
+{(problem_text or '').strip()[:2500]}
+
+Generate EXACTLY {need_hidden} NEW hidden testcases.
+Rules:
+- Each testcase must be valid for the problem.
+- Inputs MUST be different from all inputs in this avoid list (compare after whitespace normalization): {json.dumps(avoid_list)}
+- Return STRICT JSON only:
+{{ "hidden": [ {{ "stdin": "....", "expected": "...." }} ] }}
+"""
+            extra = _gemini_json(regen_prompt) or {}
+            extra_hid = extra.get("hidden") or extra.get("testcases") or []
+            added = 0
+            for tc in extra_hid:
+                if not isinstance(tc, dict):
+                    continue
+                k = _tc_key(tc)
+                if not k or k in seen_inputs:
+                    continue
+                seen_inputs.add(k)
+                hid.append(_norm_tc(tc))
+                added += 1
+                if len(hid) >= want_hidden:
+                    break
+            if added == 0:
+                break
+            need_hidden = max(0, want_hidden - len(hid))
+
+        hid = hid[:want_hidden]
+
+        ref = (p.get('referencePython') or '').strip()
+        ref_ok = True
+
+        test_results = []
+
+        if ref:
+
+            for t in hid[:6]:
+
+                if not isinstance(t, dict):
+
+                    ref_ok = False
+
+                    break
+
+                try:
+
+                    jr = _code_run(ref, t.get('stdin') or '', 'python', expected=(t.get('expected') or ''))
+
+                    test_results.append(jr)
+
+                    if not jr.get('passed'):
+
+                        ref_ok = False
+
+                        break
+
+                except Exception:
+
+                    ref_ok = False
+
+                    break
+
+        out.append({
+
+            'id': p.get('id') or (p.get('slug') or f'CODING-{i}'),
+
+            'slug': p.get('slug') or '',
+
+            'difficulty': p.get('difficulty') or difficulty,
+
+            'topic': p.get('topic') or '',
+
+            'topics': p.get('topics') if isinstance(p.get('topics'), list) else [],
+
+            'title': p.get('title') or f'Coding Problem {i}',
+
+            'statement': p.get('statement') or '',
+
+            'inputFormat': p.get('inputFormat') or '',
+
+            'outputFormat': p.get('outputFormat') or '',
+
+            'constraints': p.get('constraints') if isinstance(p.get('constraints'), list) else [],
+
+            'samples': samples,
+
+            'hiddenTests': hid,
+
+            'total_marks': (len(samples) + len(hid)),
+
+
+            # Prefer Gemini-provided starterCode (per language), but always ensure
+            # python/java/c/cpp exist so the UI can switch languages reliably.
+            'starterCode': _merge_starter_code(p.get('starterCode')),
+            # starterCodeFromBank: _default_starter_code(),
+
+            'solutionHint': p.get('solutionHint') or '',
+
+            'timeComplexity': p.get('timeComplexity') or '',
+            'spaceComplexity': p.get('spaceComplexity') or '',
+
+            'meta': {
+
+                'referencePythonProvided': bool(ref),
+
+                'referencePythonValidated': bool(ref and ref_ok),
+
+                'sampleCount': len(samples),
+
+                'hiddenCount': len(hid)
+
+            }
+
+        })
+
+    # No fallback: if Gemini still failed to generate valid problems, ask the client to regenerate.
+    if len(out) == 0:
+        raise RuntimeError("Gemini did not return any valid coding problems. Please regenerate.")
+    # Update recent coding titles cache
+    for pr in out:
+        tt = (pr.get('title') or pr.get('slug') or '').strip()
+        if tt:
+            RECENT_CODING_TITLES.append(tt)
+
+    return out
+def _mocktest_public_session(doc: dict):
+    if not doc:
+        return None
+    return {
+        "session_id": str(doc.get("session_id") or doc.get("_id") or ""),
+        "title": doc.get("title") or "Mock Test",
+        "mode": doc.get("mode") or "all",
+        "difficulty": doc.get("difficulty") or "mixed",
+        "pattern": doc.get("pattern") or {},
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+        "status": doc.get("status") or "draft",
+        "scores": doc.get("scores") or {},
+        "total_score": doc.get("total_score"),
+        "total_marks": doc.get("total_marks"),
+        "analysis": doc.get("analysis") or None,
+        "coding_details": doc.get("coding_details") or {},
+        "general_questions": doc.get("general_questions") or [],
+        "tech_questions": doc.get("tech_questions") or [],
+        "coding_problems": [
+            {k: v for k, v in (p or {}).items() if k not in ["referencePython", "referenceJudge0"]}
+            | {"hiddenTestCount": len(((p or {}).get("hiddenTests") or [])) or len(((p or {}).get("samples") or [])), "total_marks": (p or {}).get("total_marks")}
+            for p in (doc.get("coding_problems") or [])
+            if isinstance(p, dict)
+        ],
+        # include hidden tests only for evaluation endpoints, not in general fetch
+    }
+
+@app.post("/mocktest/session/create")
+def mocktest_create_session():
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+
+    payload = request.get_json(silent=True) or {}
+    mode = (payload.get("mode") or "all").strip().lower()
+    difficulty = (payload.get("difficulty") or "mixed").strip().lower()
+    pattern = payload.get("pattern") or {}
+    gen_n = int(pattern.get("general") or 0)
+    tech_n = int(pattern.get("tech") or 0)
+    coding_n = int(pattern.get("coding") or 0)
+
+    if mode == "general":
+        tech_n = 0; coding_n = 0
+    elif mode == "tech":
+        gen_n = 0; coding_n = 0
+    elif mode == "coding":
+        gen_n = 0; tech_n = 0
+    else:
+        mode = "all" 
+
+    if gen_n + tech_n + coding_n <= 0:
+        return jsonify({"error": "Pattern must include at least one question/problem count."}), 400
+
+    # Generate content
+    try:
+        general_qs = _mocktest_generate_apti_questions("general", gen_n, difficulty=difficulty) if gen_n else []
+        tech_qs = _mocktest_generate_apti_questions("tech", tech_n, difficulty=difficulty) if tech_n else []
+        coding_probs = _mocktest_generate_coding_problems(coding_n, difficulty=difficulty) if coding_n else []
+    except Exception as e:
+        # Gemini failure should not fall back silently; tell UI to regenerate.
+        if is_quota_error(e):
+            return jsonify({"error": "Quota exceeded for the Gemini API. Please try again later.", "code": "QUOTA_EXCEEDED"}), 429
+        msg = str(e) or "Gemini generation failed. Please regenerate."
+        return jsonify({"error": msg, "code": "GEMINI_GENERATION_FAILED"}), 503
+
+    total_marks = len(general_qs) + len(tech_qs) + sum(int(p.get("total_marks") or 0) for p in coding_probs)
+
+    doc = {
+        "uid": user.get("uid"),
+        "session_id": str(uuid.uuid4()),
+        "title": (payload.get("title") or "Mock Test").strip() or "Mock Test",
+        "mode": mode,
+        "pattern": {"general": gen_n, "tech": tech_n, "coding": coding_n},
+        "difficulty": difficulty,
+        "status": "ready",
+        "general_questions": general_qs,
+        "tech_questions": tech_qs,
+        "coding_problems": coding_probs,
+        "answers": {"general": {}, "tech": {}, "coding": {}},
+        "scores": {},
+        "total_score": None,
+        "total_marks": total_marks,
+        "analysis": None,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+        # camelCase mirrors (used by some admin screens / legacy code)
+        "createdAt": datetime.utcnow(),
+        "updatedAt": datetime.utcnow(),
+    }
+
+    col = _mocktest_sessions_col(get_db())
+    col.insert_one(doc)
+    return jsonify({"ok": True, "session": _mocktest_public_session(doc)})
+
+@app.get("/mocktest/sessions")
+def mocktest_list_sessions():
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    col = _mocktest_sessions_col(get_db())
+    items = list(col.find({"uid": uid}).sort("created_at", -1).limit(50))
+    # public summary list
+    out = []
+    for d in items:
+        out.append({
+            "session_id": str(d.get("session_id") or d.get("_id") or ""),
+            "title": d.get("title") or "Mock Test",
+            "mode": d.get("mode") or "all",
+            "pattern": d.get("pattern") or {},
+            "status": d.get("status") or "",
+            "created_at": d.get("created_at"),
+            "updated_at": d.get("updated_at"),
+            "total_score": d.get("total_score"),
+            "total_marks": d.get("total_marks"),
+            "scores": d.get("scores") or {},
+            "analysis": d.get("analysis") or None,
+        })
+    return jsonify({"ok": True, "sessions": out})
+
+@app.get("/mocktest/sessions/<session_id>")
+def mocktest_get_session(session_id):
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    col = _mocktest_sessions_col(get_db())
+    doc = col.find_one({"uid": uid, "session_id": session_id})
+    if not doc:
+        return jsonify({"error": "Not found"}), 404
+
+    # Return full questions + coding metadata (no hidden tests)
+    return jsonify({"ok": True, "session": _mocktest_public_session(doc), "answers": doc.get("answers") or {}})
+
+@app.post("/mocktest/code/run")
+def mocktest_code_run():
+    """Run submitted code against up to 4 provided testcases (used for sample testcases in UI).
+
+    Body: { language, source_code, tests: [{stdin, expected}...] }
+    Returns: { ok, results:[{passed, stdout, stderr, compile_output, expected, status}] }
+    """
+    payload = request.get_json(silent=True) or {}
+    t0 = time.time()
+    language = (payload.get("language") or "python").strip().lower()
+    source_code = payload.get("source_code") or ""
+    tests = payload.get("tests") or []
+    if not isinstance(tests, list) or not tests:
+        return jsonify({"error": "No tests provided"}), 400
+
+    t0 = time.time()
+
+    results = []
+    for t in tests[:4]:
+        if not isinstance(t, dict):
+            continue
+        stdin = t.get("stdin") or ""
+        expected = t.get("expected")
+        try:
+            r = _code_run(source_code, stdin, language, expected=expected)
+        except Exception as e:
+            r = {
+                "stdout": "",
+                "stderr": str(e),
+                "compile_output": "",
+                "status": "Error",
+                "status_id": 13,
+                "expected": (expected or "").strip() if expected is not None else "",
+                "passed": False,
+            }
+        r["stdin"] = t.get("stdin","")
+        results.append(r)
+
+    wall_ms = int((time.time() - t0) * 1000)
+    analysis = _gemini_code_analysis(payload.get("problem_text") or payload.get("problem") or "", source_code, language)
+    # Build per-testcase details (all are public for Run)
+    testcases = []
+    passed_count = 0
+    for i, r in enumerate(results):
+        ok = bool(r.get("passed"))
+        if ok:
+            passed_count += 1
+        testcases.append({
+            "id": i + 1,
+            "hidden": False,
+            "passed": ok,
+            "stdin": r.get("stdin", ""),
+            "expected": r.get("expected", ""),
+            "stdout": r.get("stdout", ""),
+            "stderr": r.get("stderr", ""),
+            "time_ms": r.get("time_ms"),
+            "memory_kb": r.get("memory_kb"),
+        })
+
+    return jsonify({
+        "ok": True,
+        "results": results,   # backward compatible
+        "testcases": testcases,
+        "total_tests": len(testcases),
+        "passed_tests": passed_count,
+        "sample_total": len(testcases),
+        "sample_passed": passed_count,
+        "hidden_total": 0,
+        "hidden_passed": 0,
+        "hidden_failed": 0,
+        "wall_time_ms": wall_ms,
+        "timeComplexity": analysis.get("timeComplexity"),
+        "spaceComplexity": analysis.get("spaceComplexity"),
+        "analysisReason": analysis.get("reason"),
+    }), 200
+
+
+@app.post("/mocktest/sessions/<session_id>/coding/<pid>/submit")
+def mocktest_submit_single_coding(session_id, pid):
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+
+    payload = request.get_json(silent=True) or {}
+    language = (payload.get("language") or "python").strip().lower()
+    source_code = payload.get("source_code") or ""
+
+    if not source_code.strip():
+        return jsonify({"error": "source_code is required"}), 400
+
+    col = _mocktest_sessions_col(get_db())
+    doc = col.find_one({"uid": user.get("uid"), "session_id": str(session_id)})
+    if not doc:
+        return jsonify({"error": "Session not found"}), 404
+
+    if (doc.get("status") or "").lower() == "submitted":
+        return jsonify({"error": "Session already submitted"}), 400
+
+    prob = None
+    for p in (doc.get("coding_problems") or []):
+        if isinstance(p, dict) and str(p.get("id")) == str(pid):
+            prob = p
+            break
+
+    if not prob:
+        return jsonify({"error": "Problem not found"}), 404
+
+    tests_samples = prob.get("samples") or []
+    tests_hidden = prob.get("hiddenTests") or []
+
+    def _norm_tests(arr):
+        out = []
+        for tt in (arr or []):
+            if not isinstance(tt, dict):
+                continue
+            stdin = tt.get("stdin") if tt.get("stdin") is not None else tt.get("input")
+            expected = tt.get("expected") if tt.get("expected") is not None else tt.get("output")
+            if stdin is None or expected is None:
+                continue
+            out.append({"stdin": str(stdin), "expected": str(expected)})
+        return out
+
+    tests_samples_n = _norm_tests(tests_samples)
+    tests_hidden_n = _norm_tests(tests_hidden)
+
+    # Preserve whether a testcase is sample/hidden for frontend.
+    tests = (
+        [{**t, "hidden": False} for t in (tests_samples_n or [])]
+        + [{**t, "hidden": True} for t in (tests_hidden_n or [])]
+    )
+
+    if not tests:
+        return jsonify({"error": "No tests configured for this problem"}), 400
+
+    t0 = time.time()
+    results = []
+    for i, t in enumerate(tests, start=1):
+        stdin = t.get("stdin") or ""
+        expected = t.get("expected")
+        # Explicit flags set above
+        hidden = bool(t.get("hidden", False))
+        is_sample = not hidden
+
+        try:
+            r = _code_run(source_code, stdin, language, expected=expected)
+        except Exception as e:
+            r = {
+                "stdout": "",
+                "stderr": str(e),
+                "compile_output": "",
+                "status": "Error",
+                "status_id": 13,
+                "expected": (expected or "").strip() if expected is not None else "",
+                "passed": False,
+            }
+
+        # Attach testcase metadata for frontend rendering
+        r["id"] = i
+        r["is_sample"] = is_sample
+        r["hidden"] = hidden
+        r["stdin"] = stdin
+        r["expected"] = expected if expected is not None else ""
+        results.append(r)
+
+    passed = sum(1 for r in (results or []) if r.get("passed"))
+    total = len(tests)
+    sample_total = len(tests_samples_n)
+    hidden_total = len(tests_hidden_n)
+    sample_passed = sum(1 for r in (results or [])[:sample_total] if r.get("passed"))
+    hidden_passed = sum(1 for r in (results or [])[sample_total:] if r.get("passed"))
+
+    first_fail = next((r for r in (results or []) if not r.get("passed")), None)
+    status = "Accepted" if passed == total else "Wrong Answer"
+    if first_fail and (first_fail.get("compile_output") or "").strip():
+        status = "Compilation Error"
+    elif first_fail and (first_fail.get("stderr") or "").strip():
+        status = "Runtime Error"
+
+    # ✅ Marks logic (requested): Easy 15, Medium 20, Hard 25 per problem.
+    full_marks = int(prob.get("total_marks") or 0)
+    if full_marks <= 0:
+        dd = (prob.get("difficulty") or "").strip().lower()
+        if dd == "easy":
+            full_marks = 15
+        elif dd == "medium":
+            full_marks = 20
+        elif dd in ["hard", "difficult"]:
+            full_marks = 25
+        else:
+            full_marks = 20
+
+    marks_awarded = full_marks if (passed == total and total > 0) else int(round((full_marks * (passed / max(1, total))) if total else 0))
+
+    # Build per-testcase details.
+    # Hidden testcases: do NOT expose stdin/expected/stdout, only pass/fail (+stderr if any).
+    testcases = []
+    for c in (results or []):
+        hide_io = False  # UI controls show/hide; always return full details
+        testcases.append(_case_to_public_dict(c, hide_io=hide_io))
+
+    # Best-effort complexity estimation (especially for fallback-bank problems
+    # that may not include Big-O metadata).
+    tc_analysis = None
+    try:
+        if not (prob.get("timeComplexity") or prob.get("time_complexity") or prob.get("spaceComplexity") or prob.get("space_complexity")):
+            ptxt = (
+                f"{prob.get('title') or ''}\n"
+                f"{prob.get('statement') or ''}\n\n"
+                f"Input Format:\n{prob.get('inputFormat') or ''}\n\n"
+                f"Output Format:\n{prob.get('outputFormat') or ''}\n\n"
+                f"Constraints:\n" + "\n".join([str(x) for x in (prob.get('constraints') or [])])
+            )
+            tc_analysis = _gemini_code_analysis(ptxt, source_code, language) or None
+    except Exception:
+        tc_analysis = None
+
+    summary = {
+        "passed": passed,
+        "total": total,
+        "passed_all": passed == total,
+        "status": status,
+        "sample_passed": sample_passed,
+        "sample_total": sample_total,
+        "hidden_passed": hidden_passed,
+        "hidden_total": hidden_total,
+        "marks_awarded": marks_awarded,
+        "full_marks": full_marks,
+        "at": datetime.utcnow().isoformat() + "Z",
+        "wall_time_ms": int((time.time() - t0) * 1000),
+        "timeComplexity": prob.get("timeComplexity") or prob.get("time_complexity") or (tc_analysis.get("timeComplexity") if isinstance(tc_analysis, dict) else None),
+        "spaceComplexity": prob.get("spaceComplexity") or prob.get("space_complexity") or (tc_analysis.get("spaceComplexity") if isinstance(tc_analysis, dict) else None),
+        "analysis": (tc_analysis.get("analysis") if isinstance(tc_analysis, dict) else None),
+    }
+
+    try:
+        col.update_one(
+            {"_id": doc.get("_id")},
+            {
+                "$set": {
+                    f"answers.coding.{pid}.language": language,
+                    f"answers.coding.{pid}.code": source_code,
+                    f"answers.coding.{pid}.lastSubmit": summary,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+    except Exception:
+        pass
+
+
+    # Update session-level score/marks so history shows correct totals.
+    try:
+        updated = col.find_one({"_id": doc.get("_id")}) or {}
+        answers = updated.get("answers") or {}
+        coding = (answers.get("coding") or {}) if isinstance(answers, dict) else {}
+        c_score = 0
+        c_total_marks = 0
+        for _pid, c in (coding or {}).items():
+            ls = (c or {}).get("lastSubmit") if isinstance(c, dict) else None
+            if isinstance(ls, dict):
+                c_score += int(ls.get("marks_awarded") or 0)
+                c_total_marks += int(ls.get("full_marks") or 0)
+        scores = updated.get("scores") or {}
+        if not isinstance(scores, dict):
+            scores = {}
+        scores["coding"] = c_score
+
+        # total_marks: for coding sessions use sum of per-problem marks; otherwise add aptitude MCQs too.
+        mode2 = (updated.get("mode") or "").lower()
+        base_q = int((updated.get("pattern") or {}).get("general") or 0) + int((updated.get("pattern") or {}).get("tech") or 0)
+        total_marks = c_total_marks if mode2 == "coding" else base_q + c_total_marks
+        total_score = (int(scores.get("general") or 0) + int(scores.get("tech") or 0) + int(scores.get("coding") or 0))
+
+        col.update_one({"_id": updated.get("_id")}, {"$set": {"scores": scores, "total_score": total_score, "total_marks": total_marks, "updated_at": datetime.utcnow()}})
+    except Exception:
+        pass
+
+    return jsonify({**summary, "testcases": testcases})
+
+
+@app.post("/mocktest/sessions/<session_id>/submit")
+def mocktest_submit(session_id):
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    payload = request.get_json(silent=True) or {}
+    answers = payload.get("answers") or {}
+    coding_submissions = answers.get("coding") or {}
+    gen_ans = answers.get("general") or {}
+    tech_ans = answers.get("tech") or {}
+
+    db = get_db()
+    col = _mocktest_sessions_col(db)
+    doc = col.find_one({"uid": uid, "session_id": session_id})
+    if not doc:
+        return jsonify({"error": "Not found"}), 404
+
+    # Score aptitude
+    gen_score = 0
+    tech_score = 0
+    gen_qs = doc.get("general_questions") or []
+    tech_qs = doc.get("tech_questions") or []
+
+    def _score_mcq(qs, ans_map):
+        s = 0
+        for q in qs:
+            qid = q.get("id")
+            try:
+                sel = int(ans_map.get(qid)) if ans_map.get(qid) is not None else None
+            except Exception:
+                sel = None
+            if sel is not None and sel == int(q.get("correctIndex") or 0):
+                s += int(q.get("marks") or 1)
+        return s
+
+    gen_score = _score_mcq(gen_qs, gen_ans if isinstance(gen_ans, dict) else {})
+    tech_score = _score_mcq(tech_qs, tech_ans if isinstance(tech_ans, dict) else {})
+
+    # Score coding via Judge0
+    # ✅ Marks logic: Easy 15, Medium 20, Hard 25 per coding problem.
+    coding_score = 0
+    coding_total_marks = 0
+    coding_details = {}
+    problems = doc.get("coding_problems") or []
+
+    def _coding_full_marks(pdoc: dict) -> int:
+        fm = int((pdoc or {}).get("total_marks") or 0)
+        if fm > 0:
+            return fm
+        dd = ((pdoc or {}).get("difficulty") or "").strip().lower()
+        if dd == "easy":
+            return 15
+        if dd == "medium":
+            return 20
+        if dd in ["hard", "difficult"]:
+            return 25
+        return 20
+
+    for p in problems:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("id")
+        sub = (coding_submissions.get(pid) or {}) if isinstance(coding_submissions, dict) else {}
+        # Fallback to DB-stored code/language (common when UI submits per-problem).
+        db_sub = (((doc.get("answers") or {}).get("coding") or {}).get(pid) or {}) if isinstance(doc, dict) else {}
+        lang = (sub.get("language") or db_sub.get("language") or "").strip().lower()
+        code = (sub.get("code") or db_sub.get("code") or "")
+
+        full_marks = _coding_full_marks(p)
+        coding_total_marks += full_marks
+
+        # Final submit should validate BOTH samples + hidden (Run => samples, Submit => samples + hidden)
+        samples = p.get("samples") or []
+        hidden = p.get("hiddenTests") or []
+        tests = list(samples) + list(hidden)
+        tests = [t for t in tests if isinstance(t, dict)]
+
+        per = []
+        passed = 0
+        total = len(tests)
+
+        # If final submit payload doesn't include code/lang, use cached lastSubmit from DB.
+        if (not code or not lang) and isinstance(db_sub, dict):
+            last_submit = db_sub.get("lastSubmit") or {}
+            if isinstance(last_submit, dict):
+                marks_awarded = int(last_submit.get("marks_awarded") or 0)
+                passed_cached = int(last_submit.get("passed") or last_submit.get("passed_count") or 0)
+                total_cached = int(last_submit.get("total") or total)
+                coding_score += max(0, marks_awarded)
+                coding_details[pid] = {
+                    "passed": passed_cached,
+                    "total": total_cached,
+                    "marks_awarded": marks_awarded,
+                    "full_marks": int(last_submit.get("full_marks") or full_marks),
+                    "results": last_submit.get("results") or [],
+                    "source": "cached",
+                }
+                continue
+
+        if not code or not lang:
+            coding_details[pid] = {
+                "passed": 0,
+                "total": total,
+                "marks_awarded": 0,
+                "full_marks": full_marks,
+                "results": [],
+            }
+            continue
+
+        for idx, t in enumerate(tests):
+            try:
+                jr = _code_run(code, t.get("stdin") or "", lang, expected=(t.get("expected") or ""))
+            except Exception as e:
+                jr = {"passed": False, "error": str(e)}
+            item = {k: jr.get(k) for k in ["passed", "stdout", "expected", "stderr", "compile_output", "status", "time", "memory"] if k in jr}
+            item["isSample"] = bool(idx < len(samples))
+            per.append(item)
+            if jr.get("passed"):
+                passed += 1
+
+        marks_awarded = full_marks if (passed == total and total > 0) else int(round((full_marks * (passed / max(1, total))) if total else 0))
+        coding_score += marks_awarded
+        coding_details[pid] = {
+            "passed": passed,
+            "total": total,
+            "marks_awarded": marks_awarded,
+            "full_marks": full_marks,
+            "results": per,
+        }
+
+    total_score = gen_score + tech_score + coding_score
+    # total marks: MCQs (1 each) + coding fixed marks per problem
+    total_marks = len(gen_qs) + len(tech_qs) + coding_total_marks
+
+
+    # Build topic-level performance to help Gemini give specific strong/weak topics
+    def _topic_stats(qs, ans_map):
+        stats = {}
+        for q in qs:
+            topic = (q.get("topic") or "general").strip()
+            qid = q.get("id")
+            try:
+                sel = int(ans_map.get(qid)) if ans_map.get(qid) is not None else None
+            except Exception:
+                sel = None
+            correct = (sel is not None and sel == int(q.get("correctIndex") or 0))
+            s = stats.get(topic, {"correct": 0, "total": 0})
+            s["total"] += 1
+            if correct:
+                s["correct"] += 1
+            stats[topic] = s
+        # derive strong/weak lists
+        strong = []
+        weak = []
+        for t, s in stats.items():
+            if s["total"] <= 0:
+                continue
+            acc = s["correct"] / max(1, s["total"])
+            if s["total"] >= 2 and acc >= 0.7:
+                strong.append({"topic": t, "acc": round(acc, 2), "total": s["total"]})
+            if s["total"] >= 1 and acc < 0.5:
+                weak.append({"topic": t, "acc": round(acc, 2), "total": s["total"]})
+        return {"stats": stats, "strong": strong[:5], "weak": weak[:5]}
+
+    gen_topics = _topic_stats(gen_qs, gen_ans if isinstance(gen_ans, dict) else {})
+    tech_topics = _topic_stats(tech_qs, tech_ans if isinstance(tech_ans, dict) else {})
+
+    # Coding topics: mark strong when >=60% tests passed for a problem topic
+    coding_topic_summary = {}
+    for p in problems:
+        topic = (p.get("topic") or "coding").strip()
+        pid = p.get("id")
+        det = coding_details.get(pid) or {}
+        total_t = int(det.get("total") or 0)
+        pass_t = int(det.get("passed") or 0)
+        s = coding_topic_summary.get(topic, {"passed": 0, "total": 0, "problems": 0})
+        s["passed"] += pass_t
+        s["total"] += total_t
+        s["problems"] += 1
+        coding_topic_summary[topic] = s
+
+    # Gemini analysis for stronger/weaker sections
+    analysis = None
+    try:
+        analysis_prompt = f"""
+You are an interview coach analyzing a user's mock test performance.
+Return STRICT JSON only:
+{{
+  "strong_sections": ["general|tech|coding"],
+  "weak_sections": ["general|tech|coding"],
+  "strong_topics": {{
+    "general": ["..."],
+    "tech": ["..."],
+    "coding": ["..."]
+  }},
+  "weak_topics": {{
+    "general": ["..."],
+    "tech": ["..."],
+    "coding": ["..."]
+  }},
+  "summary": "2-4 lines",
+  "overall_feedback": "2-4 lines",
+  "improve_knowledge": [
+     {{"section":"general|tech|coding","topics":["...","..."],"action_plan":"short bullet plan","resources_suggestion":"short"}}
+  ]
+}}
+
+User scores:
+- General Aptitude: {gen_score}/{len(gen_qs)}
+- Tech Aptitude: {tech_score}/{len(tech_qs)}
+- Coding (testcases passed): {coding_score}/{sum(len((p.get("hiddenTests") or [])) for p in problems)}
+
+Topic-level performance (use this to identify EXACT weak/strong topics; do NOT return generic lists):
+General strong candidates: {json.dumps(gen_topics.get("strong"))}
+General weak candidates: {json.dumps(gen_topics.get("weak"))}
+Tech strong candidates: {json.dumps(tech_topics.get("strong"))}
+Tech weak candidates: {json.dumps(tech_topics.get("weak"))}
+Coding topic summary: {json.dumps(coding_topic_summary)}
+
+Guidelines:
+- Choose strong_topics / weak_topics based on the provided accuracy summaries.
+- "Improve knowledge" should focus on weak topics first and be specific (what to study + practice type).
+- Keep it concise and practical.
+- Do NOT mention Gemini.
+"""
+        analysis = _gemini_json(analysis_prompt) or None
+    except Exception:
+        analysis = None
+
+    update = {
+        "$set": {
+            "answers": {
+                "general": gen_ans if isinstance(gen_ans, dict) else {},
+                "tech": tech_ans if isinstance(tech_ans, dict) else {},
+                "coding": coding_submissions if isinstance(coding_submissions, dict) else {},
+            },
+            "scores": {"general": gen_score, "tech": tech_score, "coding": coding_score},
+            "coding_details": coding_details,
+        "coding_total_marks": coding_total_marks,
+            "total_score": total_score,
+            "total_marks": total_marks,
+            "analysis": analysis,
+            "status": "submitted",
+            "updated_at": datetime.utcnow(),
+            "updatedAt": datetime.utcnow(),
+            "submittedAt": datetime.utcnow(),
+        }
+    }
+    col.update_one({"uid": uid, "session_id": session_id}, update)
+
+    # Send report email (Mailgun when hosted, SMTP on localhost) if user's email is available.
+    email_sent = False
+    try:
+        to_email = (user.get("email") or "").strip()
+        if to_email:
+            # ✅ Test Name + Difficulty (from session doc)
+            test_name = (
+                (doc.get("test_name") or "")
+                or (doc.get("title") or "")
+                or (doc.get("name") or "")
+                or "Zenith Mock Test"
+            ).strip()
+
+            test_difficulty = (
+                (doc.get("difficulty") or "")
+                or (doc.get("level") or "")
+                or (doc.get("selected_difficulty") or "")
+            ).strip()
+
+            test_name_display = f"{test_name} ({test_difficulty.title()})" if test_difficulty else test_name
+
+            # ✅ Date formatting (IST)
+            from datetime import timezone, timedelta
+
+            ist = timezone(timedelta(hours=5, minutes=30))
+
+            created_at = doc.get("created_at")
+            if isinstance(created_at, datetime):
+                # If stored as naive UTC datetime, treat as UTC
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                created_str = created_at.astimezone(ist).strftime("%Y-%m-%d %I:%M %p IST")
+            else:
+                created_str = "N/A"
+
+            submitted_dt = datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(ist)
+            submitted_str = submitted_dt.strftime("%Y-%m-%d %I:%M %p IST")
+
+            subj = f"{test_name_display} • Report • Score {total_score}/{total_marks}"
+
+            # Build section-wise score list ONLY for sections present in this test.
+            score_items = [f"<li><b>🏆 Total Score:</b> {total_score}/{total_marks}</li>"]
+            if len(gen_qs) > 0:
+                score_items.append(f"<li><b>🧠 General Aptitude:</b> {gen_score}/{len(gen_qs)}</li>")
+            if len(tech_qs) > 0:
+                score_items.append(f"<li><b>💻 Technical Aptitude:</b> {tech_score}/{len(tech_qs)}</li>")
+            if (coding_total_marks or 0) > 0:
+                score_items.append(f"<li><b>👨‍💻 Coding:</b> {coding_score}/{coding_total_marks}</li>")
+
+            # Gemini/AI report formatting with emojis (kept concise + practical).
+            gemini_block = ""
+            summ = ""
+            if isinstance(analysis, dict):
+                summ = analysis.get("summary")
+                overall_fb = analysis.get("overall_feedback")
+                strong_secs = analysis.get("strong_sections") or []
+                weak_secs = analysis.get("weak_sections") or []
+                strong_topics = analysis.get("strong_topics") or {}
+                weak_topics = analysis.get("weak_topics") or {}
+                improve = analysis.get("improve_knowledge") or []
+
+                def _sec_label(s):
+                    s = (s or "").strip().lower()
+                    return {"general": "General Aptitude", "tech": "Technical Aptitude", "coding": "Coding"}.get(
+                        s, s.title() or "Section"
+                    )
+
+                parts = []
+
+                # ✅ Add test meta at top
+                parts.append(f"<p><b>📝 Test Name:</b> {_html_escape(test_name_display)}</p>")
+                parts.append(f"<p><b>🗓️ Test Created:</b> {_html_escape(created_str)}<br/>"
+                            f"<b>⏰ Submitted:</b> {_html_escape(submitted_str)}</p>")
+                parts.append("<hr/>")
+
+                if summ:
+                    parts.append(f"<p><b>🧾 Summary:</b> {_html_escape(str(summ))}</p>")
+                if overall_fb:
+                    parts.append(f"<p><b>💬 Feedback:</b> {_html_escape(str(overall_fb))}</p>")
+
+                # Strong/weak sections
+                if strong_secs:
+                    parts.append(
+                        f"<p><b>✅ Strong:</b> "
+                        + ", ".join([_html_escape(_sec_label(x)) for x in strong_secs])
+                        + "</p>"
+                    )
+                if weak_secs:
+                    parts.append(
+                        f"<p><b>⚠️ Needs work:</b> "
+                        + ", ".join([_html_escape(_sec_label(x)) for x in weak_secs])
+                        + "</p>"
+                    )
+
+                # Topics (only show for sections included in this test)
+                def _topics_html(title, tmap):
+                    blocks = []
+                    for sec_key in ["general", "tech", "coding"]:
+                        if sec_key == "general" and len(gen_qs) == 0:
+                            continue
+                        if sec_key == "tech" and len(tech_qs) == 0:
+                            continue
+                        if sec_key == "coding" and int(coding_total_marks or 0) <= 0:
+                            continue
+                        arr = tmap.get(sec_key) or []
+                        arr = [str(x) for x in arr if str(x).strip()]
+                        if not arr:
+                            continue
+                        blocks.append(
+                            f"<li><b>{_html_escape(_sec_label(sec_key))}:</b> "
+                            + ", ".join([_html_escape(x) for x in arr[:8]])
+                            + "</li>"
+                        )
+                    if not blocks:
+                        return ""
+                    return f"<p><b>{title}</b></p><ul>" + "".join(blocks) + "</ul>"
+
+                parts.append(_topics_html("💪 Strong Topics", strong_topics) or "")
+                parts.append(_topics_html("🛠️ Focus Topics", weak_topics) or "")
+
+                # Action plan
+                if isinstance(improve, list) and improve:
+                    plan_items = []
+                    for item in improve[:4]:
+                        if not isinstance(item, dict):
+                            continue
+                        sec = _sec_label(item.get("section"))
+                        topics = item.get("topics") or []
+                        topics = [str(x) for x in topics if str(x).strip()]
+                        ap = (item.get("action_plan") or "").strip()
+                        res = (item.get("resources_suggestion") or "").strip()
+                        li = f"<li><b>🎯 {_html_escape(sec)}</b>"
+                        if topics:
+                            li += "<br/><span>📌 Topics: " + ", ".join([_html_escape(x) for x in topics[:8]]) + "</span>"
+                        if ap:
+                            li += "<br/><span>✅ Plan: " + _html_escape(ap) + "</span>"
+                        if res:
+                            li += "<br/><span>📚 Resources: " + _html_escape(res) + "</span>"
+                        li += "</li>"
+                        plan_items.append(li)
+                    if plan_items:
+                        parts.append("<p><b>📈 Improvement Plan</b></p><ul>" + "".join(plan_items) + "</ul>")
+
+                gemini_block = "".join([p for p in parts if p])
+
+            body_html = (
+                "<p>Your mock test has been evaluated and your report is ready ✅</p>"
+                + "<ul>" + "".join(score_items) + "</ul>"
+                + (gemini_block if gemini_block else (
+                    f"<p><b>📝 Test Name:</b> {_html_escape(test_name_display)}</p>"
+                    f"<p><b>🗓️ Test Created:</b> {_html_escape(created_str)}<br/>"
+                    f"<b>⏰ Submitted:</b> {_html_escape(submitted_str)}</p><hr/>"
+                ))
+                + "<p style='margin-top:12px'>Open Zenith to review your detailed analysis, mistakes, and recommendations.</p>"
+            )
+
+            html = _brand_email(
+                title="Zenith Mock Test Report",
+                subtitle=f"Score: {total_score}/{total_marks}",
+                body_html=body_html,
+                cta_url="/my-tests",
+                cta_text="View Mock Test History",
+            )
+
+            email_sent = bool(
+                _send_email(
+                    to_email,
+                    subj,
+                    html,
+                    text_body=(
+                        f"Test Name: {test_name_display}\n"
+                        f"Created: {created_str}\n"
+                        f"Submitted: {submitted_str}\n\n"
+                        f"Total: {total_score}/{total_marks}\n"
+                        + (f"General: {gen_score}/{len(gen_qs)}\n" if len(gen_qs) > 0 else "")
+                        + (f"Technical: {tech_score}/{len(tech_qs)}\n" if len(tech_qs) > 0 else "")
+                        + (f"Coding: {coding_score}/{coding_total_marks}\n" if (coding_total_marks or 0) > 0 else "")
+                        + (f"\nSummary: {summ}\n" if summ else "")
+                    ),
+                    kind="mocktest",
+                    reply_to=(os.getenv("CONTACT_INBOX") or os.getenv("ADMIN_EMAIL")),
+                )
+            )
+    except Exception as e:
+        # Don't crash submission if email fails; log for debugging.
+        try:
+            import traceback
+            print("[email] mock test report send failed:", repr(e))
+            traceback.print_exc()
+        except Exception:
+            pass
+
+    return jsonify({
+        "ok": True,
+        "email_sent": email_sent,
+        "scores": {"general": gen_score, "tech": tech_score, "coding": coding_score},
+        "total_score": total_score,
+        "total_marks": total_marks,
+        "analysis": analysis,
+        "coding_details": coding_details,
+        "coding_total_marks": coding_total_marks,
+    })
+
+@app.delete("/mocktest/sessions/<session_id>")
+def mocktest_delete_session(session_id):
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    uid = user.get("uid")
+    col = _mocktest_sessions_col(get_db())
+    res = col.delete_one({"uid": uid, "session_id": session_id})
+    return jsonify({"ok": True, "deleted": int(res.deleted_count or 0)})
+
+def _case_to_public_dict(case, hide_io=False):
+    """Convert internal case result to API testcase dict.
+    hide_io=True -> do not expose stdin/expected/stdout (used for hidden testcases).
+    """
+    d = {
+        "id": case.get("id"),
+        "hidden": bool(case.get("hidden", False)),
+        "passed": bool(case.get("passed", False)),
+        "time_ms": case.get("time_ms"),
+        "memory_kb": case.get("memory_kb"),
+    }
+    if hide_io:
+        d["stdin"] = ""
+        d["expected"] = ""
+        d["stdout"] = ""
+        d["stderr"] = (case.get("stderr") or "")
+    else:
+        d["stdin"] = (case.get("stdin") or "")
+        d["expected"] = (case.get("expected") or "")
+        d["stdout"] = (case.get("stdout") or "")
+        d["stderr"] = (case.get("stderr") or "")
+    return d
 if __name__ == "__main__":
     app.run(debug=True)

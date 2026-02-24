@@ -1,0 +1,334 @@
+# ---------------- ATS / RESUME TAILORING (NO AFFINDA) ----------------
+# Goal:
+# - deterministically parse resume/JD into structured signals (skills/projects/experience/education)
+# - compute a clean ATS score without "unwanted keywords" (names/emails/phones/etc.)
+# - ask Gemini to produce improvements + a tailored resume draft based on the parsed signals
+
+_STOPWORDS = set([
+    "the","and","for","with","from","this","that","to","of","in","on","a","an","as","is","are","was","were",
+    "be","by","or","at","it","we","you","your","our","their","they","he","she","them","his","her","will",
+    "can","may","should","must","have","has","had","do","does","did","not","but","if","then","than","into",
+    "about","over","under","within","across","using","use","used","also","etc","per","via"
+])
+
+_SECTION_ALIASES = {
+    "summary": ["summary","professional summary","objective","profile"],
+    "skills": ["skills","technical skills","skill set","toolbox","technologies"],
+    "experience": ["experience","work experience","professional experience","employment","internships","internship"],
+    "projects": ["projects","project","academic projects","personal projects"],
+    "education": ["education","academics","academic background","qualifications"],
+    "certifications": ["certifications","certificates","courses","training"],
+}
+
+# A lightweight lexicon of common ATS-relevant skills/tools.
+# (You can extend this list anytime; it is intentionally broad but curated.)
+_SKILL_LEXICON = [
+    # languages
+    "python","java","javascript","typescript","c","c++","c#","go","rust","kotlin","swift","sql","r","matlab","bash",
+    # web
+    "react","angular","vue","node.js","node","express","next.js","flask","django","spring","spring boot","rest","graphql",
+    "html","css","tailwind","bootstrap",
+    # data / ml
+    "pandas","numpy","scikit-learn","sklearn","tensorflow","pytorch","keras","xgboost","lightgbm",
+    "nlp","llm","generative ai","prompt engineering","rag","embeddings",
+    "data analysis","data analytics","statistics","hypothesis testing","a/b testing","experimentation",
+    "power bi","tableau","excel","spreadsheets","spss","sas",
+    # cloud / devops
+    "aws","gcp","azure","docker","kubernetes","git","github","ci/cd","linux",
+    # db
+    "mysql","postgresql","postgres","mongodb","firebase","redis","sqlite","oracle",
+    # testing / qa
+    "unit testing","integration testing","jest","pytest","selenium",
+    # mobile
+    "flutter","dart","android","ios",
+    # misc
+    "microservices","system design","oauth","jwt","api","agile","scrum"
+]
+
+# normalize lexicon (map token -> canonical label)
+def _canon_skill(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = s.replace("nodejs", "node.js")
+    s = s.replace("sklearn", "scikit-learn")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+_SKILL_CANON = {_canon_skill(x): x for x in _SKILL_LEXICON}
+
+_EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", re.I)
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
+_PHONE_RE = re.compile(r"(\+?\d[\d\s\-()]{7,}\d)")
+
+def _clean_text_basic(text: str) -> str:
+    t = (text or "")
+    t = _EMAIL_RE.sub(" ", t)
+    t = _URL_RE.sub(" ", t)
+    t = _PHONE_RE.sub(" ", t)
+    t = t.replace("\x00", " ")
+    return t
+
+def _tokenize(text: str) -> list:
+    t = re.sub(r"[^a-z0-9\+\#\.\s]", " ", (text or "").lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return []
+    return t.split()
+
+def _extract_skill_mentions(text: str) -> list:
+    """
+    Return a de-duplicated list of skills (canonicalized) found in the text.
+    Matches:
+      - exact lexicon phrases (including multi-word)
+      - common variants (node, node.js, scikit-learn/sklearn)
+    """
+    t = _clean_text_basic(text).lower()
+    # phrase match for multi-word skills
+    found = set()
+    for canon, pretty in _SKILL_CANON.items():
+        if " " in canon:
+            if canon in t:
+                found.add(pretty)
+    # token-level match for single words (and short tokens like c++)
+    toks = set(_tokenize(t))
+    for canon, pretty in _SKILL_CANON.items():
+        if " " in canon:
+            continue
+        if canon in toks:
+            found.add(pretty)
+    # also map "node" -> node.js if present
+    if "node" in toks and ("node.js" in _SKILL_CANON):
+        found.add(_SKILL_CANON["node.js"])
+    # consistent ordering
+    return sorted(found, key=lambda x: x.lower())
+
+def _split_into_sections(text: str) -> dict:
+    """Best-effort section split based on common resume/JD headings."""
+    raw = _clean_text_basic(text)
+    lines = [ln.rstrip() for ln in raw.splitlines()]
+
+    heading_to_key = {}
+    for key, aliases in _SECTION_ALIASES.items():
+        for a in aliases:
+            heading_to_key[a.lower()] = key
+
+    sections = {}
+    cur_key = "other"
+    buf = []
+
+    def flush():
+        nonlocal buf, cur_key
+        s = "\n".join(buf).strip()
+        if s:
+            sections[cur_key] = (sections.get(cur_key, "") + "\n" + s).strip()
+        buf = []
+
+    for ln in lines:
+        norm = re.sub(r"[^a-z0-9\s]", "", ln.lower()).strip()
+        if 1 <= len(norm) <= 35 and norm in heading_to_key:
+            flush()
+            cur_key = heading_to_key[norm]
+            continue
+        if ln.strip() and ln.strip().isupper():
+            norm2 = re.sub(r"[^a-z0-9\s]", "", ln.lower()).strip()
+            if norm2 in heading_to_key:
+                flush()
+                cur_key = heading_to_key[norm2]
+                continue
+        buf.append(ln)
+    flush()
+    return sections
+
+def _estimate_experience_years(exp_text: str) -> float:
+    """Estimate experience duration from year ranges in Experience section."""
+    t = _clean_text_basic(exp_text)
+    years = [int(y) for y in re.findall(r"\b(19\d{2}|20\d{2})\b", t)]
+    years = [y for y in years if 1980 <= y <= datetime.utcnow().year + 1]
+    years = sorted(set(years))
+    if len(years) >= 2:
+        return max(0.0, float(max(years) - min(years)))
+    intern_mentions = len(re.findall(r"\bintern\b|\binternship\b", t, re.I))
+    if intern_mentions:
+        return 0.5 * intern_mentions
+    return 0.0
+
+def _extract_education_lines(edu_text: str) -> list:
+    out = []
+    for ln in (edu_text or "").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if re.search(r"\b(b\.?e|b\.?tech|bachelor|m\.?s|m\.?tech|master|ph\.?d|university|college)\b", s, re.I):
+            out.append(s)
+    return out[:12]
+
+def _extract_project_summaries(proj_text: str) -> list:
+    """Split projects into chunks and attach detected tech stack."""
+    t = (proj_text or "").strip()
+    if not t:
+        return []
+    chunks = re.split(r"\n\s*\n+", t)
+    out = []
+    for ch in chunks:
+        s = ch.strip()
+        if not s:
+            continue
+        skills = _extract_skill_mentions(s)
+        first_line = s.splitlines()[0].strip()
+        title = first_line[:120]
+        out.append({"title": title, "skills": skills[:12], "snippet": s[:600]})
+        if len(out) >= 6:
+            break
+    return out
+
+def _parse_resume_structured(resume_text: str) -> dict:
+    sections = _split_into_sections(resume_text)
+    skills = set(_extract_skill_mentions(sections.get("skills","") + "\n" + resume_text))
+    edu_lines = _extract_education_lines(sections.get("education",""))
+    projects = _extract_project_summaries(sections.get("projects",""))
+    exp_years = _estimate_experience_years(sections.get("experience",""))
+    return {
+        "skills": sorted(skills, key=lambda x: x.lower()),
+        "experience_years_est": round(exp_years, 2),
+        "education_lines": edu_lines,
+        "projects": projects,
+        "sections_present": sorted([k for k,v in sections.items() if (v or "").strip()]),
+    }
+
+def _parse_jd_structured(jd_text: str) -> dict:
+    skills = set(_extract_skill_mentions(jd_text))
+    t = _clean_text_basic(jd_text).lower()
+    phrases = set()
+    for m in re.finditer(r"\b([a-z][a-z0-9]+(?:\s+[a-z][a-z0-9]+){1,2})\b", t):
+        ph = m.group(1).strip()
+        if any(w in _STOPWORDS for w in ph.split()):
+            continue
+        if len(ph) < 6 or len(ph) > 35:
+            continue
+        if _EMAIL_RE.search(ph) or _URL_RE.search(ph) or _PHONE_RE.search(ph):
+            continue
+        if re.search(r"\b(analysis|analytics|testing|engineering|reporting|visualization|database|cloud|api|automation|ml|ai|data)\b", ph):
+            phrases.add(ph)
+    return {
+        "skills": sorted(skills, key=lambda x: x.lower()),
+        "skill_phrases": sorted(list(phrases))[:60],
+    }
+
+def _compute_ats_score_structured(jd: dict, resume: dict) -> dict:
+    jd_skills = set([_canon_skill(x) for x in (jd.get("skills") or [])])
+    res_skills = set([_canon_skill(x) for x in (resume.get("skills") or [])])
+
+    matched = sorted({s for s in jd_skills if s in res_skills})
+    missing = sorted({s for s in jd_skills if s not in res_skills})
+
+    coverage = (len(matched) / max(1, len(jd_skills))) if jd_skills else 0.0
+
+    skills_score = round(60.0 * min(1.0, coverage), 1)
+
+    exp_years = float(resume.get("experience_years_est") or 0.0)
+    exp_score = 0.0
+    if exp_years >= 3:
+        exp_score = 20.0
+    elif exp_years >= 2:
+        exp_score = 14.0
+    elif exp_years >= 1:
+        exp_score = 8.0
+
+    proj_count = len(resume.get("projects") or [])
+    proj_score = min(10.0, 3.0 * proj_count)
+    edu_score = 10.0 if (resume.get("education_lines") or []) else 5.0
+
+    total = skills_score + exp_score + proj_score + edu_score
+    score = int(round(min(100.0, total)))
+
+    return {
+        "score": score,
+        "coverage": round(coverage * 100, 1),
+        "matched_skills": matched[:40],
+        "missing_skills": missing[:40],
+        "score_breakdown": {
+            "skills": skills_score,
+            "experience": exp_score,
+            "projects": round(proj_score, 1),
+            "education": round(edu_score, 1),
+        }
+    }
+
+def _gemini_tailor_prompt(jd_text: str, resume_text: str, jd_struct: dict, resume_struct: dict, ats_struct: dict) -> str:
+    import json
+    return f"""You are an ATS scoring engine + resume tailoring assistant.
+
+You will be given:
+- Job Description (JD) text
+- Resume text
+- Parsed structured signals (skills/projects/experience/education)
+- A deterministic ATS score + matched/missing skills computed by our parser
+
+TASKS:
+1) Use the structured signals to produce an ATS score from 0-100 (can be same as deterministic score, or adjust slightly if justified).
+2) Explain score briefly (2-4 lines).
+3) Provide 10-12 prioritized improvements (bullet list).
+4) Provide a tailored resume draft (TEXT) that the candidate can copy-paste:
+   - Professional Summary (3-4 lines)
+   - Skills (grouped)
+   - Experience bullets (rewrite 6-10 bullets max, STAR + metrics placeholders)
+   - Projects bullets (rewrite 4-6 bullets max)
+   - Keep it truthful: DO NOT invent companies, degrees, or years not in the resume text.
+   - You may rephrase existing work/projects and add missing keywords ONLY if they are reasonable to claim as \"familiarity\" (not years of experience).
+Return ONLY JSON with keys:
+ats_score, reasoning_summary, improvements, missing_skills_priority, tailored_resume_text
+
+Deterministic signals (JSON):
+JD_STRUCT={json.dumps(jd_struct, ensure_ascii=False)[:12000]}
+RESUME_STRUCT={json.dumps(resume_struct, ensure_ascii=False)[:12000]}
+ATS_STRUCT={json.dumps(ats_struct, ensure_ascii=False)[:12000]}
+
+JD_TEXT:
+{(jd_text or "")[:12000]}
+
+RESUME_TEXT:
+{(resume_text or "")[:20000]}
+"""
+
+@app.post("/ats/analyze")
+def ats_analyze():
+    """multipart/form-data: resume_file (PDF) + jd_file (PDF) OR jd_text"""
+    user, err = require_user()
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+
+    resume_file = request.files.get("resume_file")
+    if not resume_file:
+        return jsonify({"error": "resume_file is required"}), 400
+    resume_bytes = resume_file.read() or b""
+    resume_text = _extract_pdf_text_bytes(resume_bytes)
+    if not resume_text:
+        return jsonify({"error": "Could not extract text from resume PDF"}), 400
+
+    jd_text = (request.form.get("jd_text") or "").strip()
+    jd_file = request.files.get("jd_file")
+    if (not jd_text) and jd_file:
+        jd_text = _extract_pdf_text_bytes(jd_file.read() or b"")
+    if not jd_text:
+        return jsonify({"error": "Provide jd_text or jd_file (PDF)"}), 400
+
+    resume_struct = _parse_resume_structured(resume_text)
+    jd_struct = _parse_jd_structured(jd_text)
+    ats_struct = _compute_ats_score_structured(jd_struct, resume_struct)
+
+    tips = {}
+    try:
+        raw = get_gemini_response(_gemini_tailor_prompt(jd_text, resume_text, jd_struct, resume_struct, ats_struct)).strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(json)?", "", raw).strip()
+            raw = raw.strip("`").strip()
+        tips = json.loads(raw)
+    except Exception:
+        tips = {}
+
+    return jsonify({
+        "ok": True,
+        "ats": ats_struct,
+        "parsed_resume": resume_struct,
+        "parsed_jd": jd_struct,
+        "tips": tips,
+    })

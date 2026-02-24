@@ -2,52 +2,60 @@
   {
     "Week 1": [
       {
-        "topic": "Rust Programming Language advanced ownership borrowing lifetimes deep dive",
-        "video": "https://www.youtube.com/watch?v=h2J6zoS56UQ"
+        "topic": "Machine Learning end to end project workflow advanced",
+        "video": "https://www.youtube.com/watch?v=761SQ9Hxbic"
       },
       {
-        "topic": "Rust Programming Language smart pointers Box Rc Arc Mutex Cell RefCell",
-        "video": "No video found"
+        "topic": "Machine Learning feature engineering for complex projects best practices",
+        "video": "https://www.youtube.com/watch?v=ZXiruGOCn9s"
       },
       {
-        "topic": "Rust Programming Language async await concurrency patterns",
-        "video": "https://www.youtube.com/watch?v=qP7LzZqGh30"
+        "topic": "Machine Learning custom model architecture design for unique projects",
+        "video": "https://www.youtube.com/watch?v=F5RrybksQ2Y"
       },
       {
-        "topic": "Rust Programming Language Tokio framework advanced usage",
-        "video": "https://www.youtube.com/watch?v=0y6RKiIk6cs"
+        "topic": "Machine Learning transfer learning finetuning for project specific tasks",
+        "video": "https://www.youtube.com/watch?v=bZcKYiwtw1I"
       },
       {
-        "topic": "Rust Programming Language performance optimization techniques low level",
-        "video": "https://www.youtube.com/watch?v=4gwYkEK0gOk"
+        "topic": "Machine Learning explainable AI LIME SHAP for project interpretation",
+        "video": "https://www.youtube.com/watch?v=It2Q1eK_Klc"
       },
       {
-        "topic": "Rust Programming Language unsafe code considerations FFI interop",
-        "video": "No video found"
+        "topic": "Machine Learning MLOps pipeline setup for production projects",
+        "video": "https://www.youtube.com/watch?v=6kEGUCrBEU0"
       },
       {
-        "topic": "Rust Programming Language advanced trait object dynamic dispatch scenarios",
-        "video": "No video found"
+        "topic": "Machine Learning model deployment serverless functions for projects",
+        "video": "https://www.youtube.com/watch?v=mJJpZ70q9M0"
       },
       {
-        "topic": "Rust Programming Language custom error handling patterns best practices",
-        "video": "https://www.youtube.com/watch?v=-mN3VyJuCjM"
+        "topic": "Machine Learning real time inference optimization for project applications",
+        "video": "https://www.youtube.com/watch?v=00Q0G84kq3M"
       },
       {
-        "topic": "Rust Programming Language procedural macros for code generation",
-        "video": "https://www.youtube.com/watch?v=59mWuOXs3dU"
+        "topic": "Machine Learning federated learning implementation for privacy projects",
+        "video": "https://www.youtube.com/watch?v=qiUEgSCyY5o"
       },
       {
-        "topic": "Rust Programming Language advanced testing strategies benchmarks fuzzer",
-        "video": "https://www.youtube.com/watch?v=gnchfOojMk4"
+        "topic": "Machine Learning reinforcement learning project environments advanced",
+        "video": "https://www.youtube.com/watch?v=C2zw2H1c5Fk"
       },
       {
-        "topic": "Rust Programming Language data structures algorithms for interviews",
-        "video": "https://www.youtube.com/watch?v=8hly31xKli0"
+        "topic": "Machine Learning generative adversarial networks GAN project examples",
+        "video": "https://www.youtube.com/watch?v=TpMIssRdhco"
       },
       {
-        "topic": "Rust Programming Language common interview questions solutions explained",
-        "video": "https://www.youtube.com/watch?v=lL_j7ilk7rc"
+        "topic": "Machine Learning graph neural networks GNN project applications",
+        "video": "https://www.youtube.com/watch?v=y7sXDpffzQQ"
+      },
+      {
+        "topic": "Machine Learning ethical considerations fairness in project development",
+        "video": "https://www.youtube.com/watch?v=aGwYtUzMQUk"
+      },
+      {
+        "topic": "Machine Learning scalable data pipelines for large projects",
+        "video": "https://www.youtube.com/watch?v=bAyrObl7TYE"
       }
     ]
   }
