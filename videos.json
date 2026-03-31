@@ -2,100 +2,116 @@
   {
     "Week 1": [
       {
-        "topic": "Angular JS large scale application architecture",
-        "video": "https://www.youtube.com/watch?v=a6E5pzst2YE"
+        "topic": "circular linked list Data Structures implementation",
+        "video": "https://www.youtube.com/watch?v=HMkdlu5sP4A"
       },
       {
-        "topic": "Angular JS modular design patterns project",
-        "video": "https://www.youtube.com/watch?v=8MjVAVQ7fyY"
+        "topic": "doubly linked list Data Structures reverse recursive",
+        "video": "https://www.youtube.com/watch?v=63HJ2-jV6Mk"
       },
       {
-        "topic": "Angular JS advanced custom directive creation",
-        "video": "https://www.youtube.com/watch?v=dADWO1Wh6-4"
+        "topic": "Data Structures array vs arraylist performance analysis",
+        "video": "https://www.youtube.com/watch?v=ft0owvS5tQA"
       },
       {
-        "topic": "Angular JS component communication strategies project",
-        "video": "https://www.youtube.com/watch?v=n1a2eQ0Zyls"
+        "topic": "advanced Data Structures array manipulation techniques",
+        "video": "https://www.youtube.com/watch?v=bxRVz8zklWM"
       },
       {
-        "topic": "Angular JS performance optimization techniques",
-        "video": "https://www.youtube.com/watch?v=d5eIU5PEH8A"
+        "topic": "Data Structures stack problems for interviews",
+        "video": "https://www.youtube.com/watch?v=cQWr9DFE1ww"
       },
       {
-        "topic": "Angular JS digest cycle performance tuning",
-        "video": "No video found"
+        "topic": "implement Data Structures queue using two stacks",
+        "video": "https://www.youtube.com/watch?v=sFvP5Ois0CE"
       },
       {
-        "topic": "Angular JS lazy loading modules project implementation",
-        "video": "https://www.youtube.com/watch?v=ua2NONiy-7A"
+        "topic": "min heap max heap Data Structures complexities",
+        "video": "https://www.youtube.com/watch?v=j6iP4lDTKyI"
       },
       {
-        "topic": "Angular JS memory leak debugging real world",
-        "video": "No video found"
+        "topic": "priority queue Data Structures advanced applications",
+        "video": "https://www.youtube.com/watch?v=m9SVfOYTaBQ"
       },
       {
-        "topic": "Angular JS advanced data binding complex forms",
-        "video": "https://www.youtube.com/watch?v=iiADhChRriM"
+        "topic": "AVL tree Data Structures rotations explained",
+        "video": "https://www.youtube.com/watch?v=zP2xbKerIds"
       },
       {
-        "topic": "Angular JS state management patterns large apps",
-        "video": "https://www.youtube.com/watch?v=59mWuOXs3dU"
+        "topic": "red black tree Data Structures insertion deletion visualization",
+        "video": "https://www.youtube.com/watch?v=94ErZ5K8XZg"
       },
       {
-        "topic": "Angular JS RxJS observables integration project",
-        "video": "https://www.youtube.com/watch?v=k5S-hGkFL70"
+        "topic": "segment tree Data Structures range query update",
+        "video": "https://www.youtube.com/watch?v=CWDQJGaN1gY"
       },
       {
-        "topic": "Angular JS real time application web sockets",
-        "video": "https://www.youtube.com/watch?v=1BfCnjr_Vjg"
+        "topic": "trie Data Structures autocomplete implementation",
+        "video": "https://www.youtube.com/watch?v=zIjfhVPRZCg"
       },
       {
-        "topic": "Angular JS end to end testing Protractor advanced",
-        "video": "https://www.youtube.com/watch?v=0PqHyqA1PJU"
+        "topic": "Dijkstra's algorithm Data Structures shortest path",
+        "video": "https://www.youtube.com/watch?v=Gd92jSu_cZk"
       },
       {
-        "topic": "Angular JS unit testing services controllers mocks",
-        "video": "https://www.youtube.com/watch?v=XVFqOFKGeGM"
+        "topic": "Floyd Warshall algorithm Data Structures all pairs shortest path",
+        "video": "https://www.youtube.com/watch?v=i9SZKy2yTZw"
       },
       {
-        "topic": "Angular JS CI CD pipeline setup production",
-        "video": "https://www.youtube.com/watch?v=J9JbzsufemE"
+        "topic": "minimum spanning tree Data Structures Kruskal's Prim's",
+        "video": "https://www.youtube.com/watch?v=h6cUkkaKNHw"
       },
       {
-        "topic": "Angular JS Webpack configuration optimization",
-        "video": "https://www.youtube.com/watch?v=GfeUrQ-xQN4"
+        "topic": "topological sort Data Structures cycle detection",
+        "video": "https://www.youtube.com/watch?v=ChxA6H2253I"
       },
       {
-        "topic": "Angular JS security best practices XSS CSRF",
-        "video": "https://www.youtube.com/watch?v=eWEgUcHPle0"
+        "topic": "collision resolution techniques Data Structures open addressing",
+        "video": "https://www.youtube.com/watch?v=j612Fj-mgCY"
       },
       {
-        "topic": "Angular JS authentication authorization project implementation",
-        "video": "https://www.youtube.com/watch?v=GcVtElYa17s"
+        "topic": "custom hash function Data Structures implementation guide",
+        "video": "https://www.youtube.com/watch?v=0wFI04w345k"
       },
       {
-        "topic": "Angular JS error handling logging strategies",
-        "video": "https://www.youtube.com/watch?v=9RksQ5YT7FM"
+        "topic": "disjoint set union find Data Structures path compression by rank",
+        "video": "https://www.youtube.com/watch?v=xxHKEnHjLyw"
       },
       {
-        "topic": "Angular JS deployment strategies production",
-        "video": "https://www.youtube.com/watch?v=0M8AYU_hPas"
+        "topic": "union by rank Data Structures find by path compression explained",
+        "video": "https://www.youtube.com/watch?v=sk46MJ_h8Sk"
       },
       {
-        "topic": "Angular JS server side rendering SSR benefits",
-        "video": "https://www.youtube.com/watch?v=LrEqJUCwEyY"
+        "topic": "dynamic programming problems Data Structures tabulation",
+        "video": "https://www.youtube.com/watch?v=sWnBVPRA0yQ"
       },
       {
-        "topic": "Angular JS advanced UI component libraries integration",
-        "video": "https://www.youtube.com/watch?v=k5E2AVpwsko"
+        "topic": "greedy algorithms Data Structures optimization problems",
+        "video": "https://www.youtube.com/watch?v=zPtI8q9gvX8"
       },
       {
-        "topic": "Angular JS Micro Frontends architecture patterns",
-        "video": "https://www.youtube.com/watch?v=gOuAqRaDdHA"
+        "topic": "memoization vs tabulation Data Structures problems",
+        "video": "https://www.youtube.com/watch?v=5dRGRueKU3M"
       },
       {
-        "topic": "Angular JS upgrading legacy applications guide",
-        "video": "https://www.youtube.com/watch?v=Us8CXant1M4"
+        "topic": "knapsack problem Data Structures dynamic programming variations",
+        "video": "https://www.youtube.com/watch?v=PfkBS9qIMRE"
+      },
+      {
+        "topic": "top 50 Data Structures interview questions",
+        "video": "https://www.youtube.com/watch?v=2AckU9AZc0w"
+      },
+      {
+        "topic": "hard Data Structures problems for placements",
+        "video": "https://www.youtube.com/watch?v=Nx4bvwU0DqE"
+      },
+      {
+        "topic": "Big O notation Data Structures time space complexity analysis",
+        "video": "https://www.youtube.com/watch?v=FPu9Uld7W-E"
+      },
+      {
+        "topic": "system design Data Structures choices discussion",
+        "video": "https://www.youtube.com/watch?v=-mN3VyJuCjM"
       }
     ]
   }

@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 
 import os, json, re, io, tempfile
-import sqlite3
 from html import escape as _html_escape
 import time
 import uuid
@@ -440,7 +439,7 @@ MAIL_FROM_COURSES = (os.getenv("MAIL_FROM_COURSES") or "courses@zenithlearning.s
 MAIL_FROM_PROFILE = (os.getenv("MAIL_FROM_PROFILE") or "profile@zenithlearning.site").strip()
 MAIL_FROM_ADMIN = (os.getenv("MAIL_FROM_ADMIN") or "admin@zenithlearning.site").strip()
 MAIL_FROM_CONTACT = (os.getenv("MAIL_FROM_CONTACT") or "contact@zenithlearning.site").strip()
-MAIL_FROM_MOCKTEST = (os.getenv("MAIL_FROM_MOCKTEST") or os.getenv("MAIL_FROM_TESTS") or "zenith-tests@zenithlearning.site").strip()
+MAIL_FROM_MOCKTEST = (os.getenv("MAIL_FROM_MOCKTEST") or os.getenv("MAIL_FROM_TESTS") or "mock-tests@zenithlearning.site").strip()
 MAIL_FROM_ATS = (os.getenv("MAIL_FROM_ATS") or os.getenv("MAIL_FROM_ATS_INTELLIGENCE") or "ats-intelligence@zenithlearning.site").strip()
 
 # Optional: use SendGrid API instead of SMTP (kept for safety, but Mailgun removed)
@@ -489,132 +488,12 @@ def _pick_from(kind: str = "") -> str:
         return MAIL_FROM_ADMIN or MAIL_FROM_DEFAULT
     if k in ("contact",):
         return MAIL_FROM_CONTACT or MAIL_FROM_DEFAULT
-    if k in ("mocktest", "mock-tests", "tests", "mock_test", "practicetest", "practice_test"):
+    if k in ("mocktest","mock-tests","tests","mock_test"):
         return MAIL_FROM_MOCKTEST or MAIL_FROM_DEFAULT
     if k in ("ats","ats-intelligence","ats_intelligence"):
         return MAIL_FROM_ATS or MAIL_FROM_DEFAULT
     return MAIL_FROM_DEFAULT or SMTP_USER
 
-
-def _pick_sender_name(kind: str = "") -> str:
-    k = (kind or "").strip().lower()
-    if k in ("auth", "authentication", "login"):
-        return "zenith-authentication"
-    if k in ("courses", "course", "quiz"):
-        return "zenith-courses"
-    if k in ("profile",):
-        return "zenith-profile"
-    if k in ("admin",):
-        return "zenith-admin"
-    if k in ("contact",):
-        return "zenith-contact"
-    if k in ("mocktest", "mock-tests", "tests", "mock_test", "practicetest", "practice_test"):
-        return "zenith-tests"
-    if k in ("ats", "ats-intelligence", "ats_intelligence"):
-        return "zenith-ats"
-    return "zenith-learning"
-
-
-def _sanitize_test_name_for_email(name: str, *, is_practice: bool = False) -> str:
-    raw = str(name or "").strip()
-    if not raw:
-        return "Practice Test" if is_practice else "Mock Test"
-    if is_practice:
-        raw = re.sub(r"\bproctoring\b", "", raw, flags=re.I)
-        raw = re.sub(r"\s{2,}", " ", raw).strip(" -•_")
-        return raw or "Practice Test"
-    return raw
-
-
-def _format_proctoring_warning_item(item) -> str:
-    if isinstance(item, dict):
-        msg = str(item.get("message") or item.get("warning") or item.get("type") or "Warning recorded").strip()
-        at = str(item.get("at_ist") or item.get("at") or item.get("time") or "").strip()
-        return f"{msg} ({at})" if at else msg
-    return str(item or "").strip()
-
-
-def _format_proctoring_event_item(item) -> tuple[str, str]:
-    if isinstance(item, dict):
-        msg = str(item.get("message") or item.get("warning") or item.get("type") or "Violation recorded").strip()
-        at = str(item.get("at_ist") or item.get("at") or item.get("time") or "").strip()
-        return msg, at
-    raw = str(item or "").strip()
-    return raw, ""
-
-
-def _proctoring_details_html(proctoring: dict) -> str:
-    p = proctoring if isinstance(proctoring, dict) else {}
-    if not p or not p.get("enabled"):
-        return ""
-
-    violations = int(p.get("violations") or 0)
-    limit = int(p.get("violation_limit") or 0)
-    warnings = []
-    for item in (p.get("warnings") or []):
-        formatted = _format_proctoring_warning_item(item)
-        if formatted:
-            warnings.append(formatted)
-    events = p.get("events") or []
-    reason = str(p.get("auto_submit_reason") or "").strip()
-
-    event_lines = []
-    for ev in events[-5:]:
-        msg, at = _format_proctoring_event_item(ev)
-        if not msg:
-            continue
-        line = _html_escape(msg)
-        if at:
-            line += f" <span style='color:#6b7280;'>(at {_html_escape(at)})</span>"
-        event_lines.append(f"<li>{line}</li>")
-
-    parts = [
-        "<hr/>",
-        "<p><b>🛡️ Proctoring Details</b></p>",
-        f"<ul><li><b>Violations:</b> {violations}/{limit or 3}</li>"
-        + (f"<li><b>Status:</b> Auto-submitted</li>" if p.get("auto_submitted") else "<li><b>Status:</b> Completed without auto-submit</li>")
-        + (f"<li><b>Reason:</b> {_html_escape(reason)}</li>" if reason else "")
-        + "</ul>",
-    ]
-    if warnings:
-        parts.append("<p><b>Warnings</b></p><ul>" + "".join(f"<li>{_html_escape(w)}</li>" for w in warnings[-5:]) + "</ul>")
-    if event_lines:
-        parts.append("<p><b>Recent Proctoring Events</b></p><ul>" + "".join(event_lines) + "</ul>")
-    return "".join(parts)
-
-
-def _proctoring_details_text(proctoring: dict) -> str:
-    p = proctoring if isinstance(proctoring, dict) else {}
-    if not p or not p.get("enabled"):
-        return ""
-    violations = int(p.get("violations") or 0)
-    limit = int(p.get("violation_limit") or 0)
-    warnings = []
-    for item in (p.get("warnings") or []):
-        formatted = _format_proctoring_warning_item(item)
-        if formatted:
-            warnings.append(formatted)
-    events = p.get("events") or []
-    reason = str(p.get("auto_submit_reason") or "").strip()
-    lines = [
-        "",
-        "Proctoring Details:",
-        f"Violations: {violations}/{limit or 3}",
-        f"Status: {'Auto-submitted' if p.get('auto_submitted') else 'Completed without auto-submit'}",
-    ]
-    if reason:
-        lines.append(f"Reason: {reason}")
-    if warnings:
-        lines.append("Warnings:")
-        lines.extend([f"- {w}" for w in warnings[-5:]])
-    if events:
-        lines.append("Recent Proctoring Events:")
-        for ev in events[-5:]:
-            msg, at = _format_proctoring_event_item(ev)
-            if not msg:
-                continue
-            lines.append(f"- {msg}" + (f" (at {at})" if at else ""))
-    return "\n".join(lines)
 
 def _is_local_dev() -> bool:
     """Best-effort detection: treat localhost/dev as local."""
@@ -651,7 +530,6 @@ def _send_email_sync_smtp(
     html_body: str,
     text_body: str = "",
     *,
-    kind: str = "",
     from_email: str = None,
     reply_to: str = None,
 ) -> bool:
@@ -671,7 +549,7 @@ def _send_email_sync_smtp(
     sender = (from_email or MAIL_FROM_DEFAULT or SMTP_USER).strip()
 
     msg = MIMEMultipart("alternative")
-    msg["From"] = f"{_pick_sender_name(kind)} <{sender}>"
+    msg["From"] = f"Zenith Learning <{sender}>"
     msg["To"] = to_email
     msg["Subject"] = subject
     if reply_to:
@@ -712,7 +590,7 @@ def _send_email_sync_smtp(
             pass
         return False
 
-def _send_email_sync_sendgrid(to_email: str, subject: str, html_body: str, text_body: str = "", *, kind: str = "") -> bool:
+def _send_email_sync_sendgrid(to_email: str, subject: str, html_body: str, text_body: str = "") -> bool:
     """Send email via SendGrid Web API. Returns True if accepted by SendGrid."""
     api_key = os.getenv("SENDGRID_API_KEY", "").strip()
     if not api_key:
@@ -732,7 +610,7 @@ def _send_email_sync_sendgrid(to_email: str, subject: str, html_body: str, text_
             "to": [{"email": to_email}],
             "subject": subject,
         }],
-        "from": {"email": from_email, "name": _pick_sender_name(kind)},
+        "from": {"email": from_email, "name": "Zenith Learning"},
         "content": [
             {"type": "text/plain", "value": text_body or " "},
             {"type": "text/html", "value": html_body},
@@ -778,7 +656,6 @@ def _send_email_sync_mailgun(
     html_body: str,
     text_body: str = "",
     *,
-    kind: str = "",
     from_email: str = None,
     reply_to: str = None,
 ) -> bool:
@@ -801,7 +678,7 @@ def _send_email_sync_mailgun(
         return False
 
     data = {
-        "from": f"{_pick_sender_name(kind)} <{from_email}>",
+        "from": f"Zenith Learning <{from_email}>",
         "to": [to_email],
         "subject": subject,
         "text": text_body or " ",
@@ -902,16 +779,16 @@ def _send_email(
         provider = _preferred_mail_provider()
 
         if provider == "sendgrid":
-            if _send_email_sync_sendgrid(to_email, subject, html_body, text_body, kind=kind):
+            if _send_email_sync_sendgrid(to_email, subject, html_body, text_body):
                 return
             provider = "mailgun" if _mailgun_ready() else "smtp"
 
         if provider == "mailgun":
-            if _send_email_sync_mailgun(to_email, subject, html_body, text_body, kind=kind, from_email=from_email, reply_to=reply_to):
+            if _send_email_sync_mailgun(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to):
                 return
             provider = "smtp"
 
-        _send_email_sync_smtp(to_email, subject, html_body, text_body, kind=kind, from_email=from_email, reply_to=reply_to)
+        _send_email_sync_smtp(to_email, subject, html_body, text_body, from_email=from_email, reply_to=reply_to)
 
     try:
         import threading
@@ -935,7 +812,6 @@ def _brand_email(
     cta_text: str = "",
     cta2_url: str = "",
     cta2_text: str = "",
-    kind: str = "",
     **_ignore,
 ):
     """Return a professional, branded email HTML.
@@ -962,7 +838,7 @@ def _brand_email(
     # Subtitle is what we want to SHOW below the title. Preheader is still used as the hidden inbox preview.
     visible_subtitle = (subtitle or preheader or "").strip()
     hidden_preheader = (preheader or subtitle or "").strip()
-    logo_text = _pick_sender_name(kind)
+    logo_text = "Zenith Learning"
     year = datetime.now().year
     primary_btn = ""
     if primary_cta and primary_cta.get("url") and primary_cta.get("label"):
@@ -1023,7 +899,7 @@ def _brand_email(
               <td style="padding:0 24px 22px 24px;">
                 <div style="border-top:1px solid #e5e7eb;padding-top:14px;font-size:12px;color:#6b7280;line-height:1.6;">
                   Need help? Reply to this email or contact our team from the <b>Contact</b> page in the app.<br/>
-                  <span style="color:#9ca3af;">© {year} {logo_text}. All rights reserved.</span>
+                  <span style="color:#9ca3af;">© {year} Zenith Learning. All rights reserved.</span>
                 </div>
               </td>
             </tr>
@@ -9166,9 +9042,6 @@ def _ensure_main_in_starter(code: str, lang: str) -> str:
     c = code.strip("\n")
     l = (lang or "python").strip().lower()
 
-    if l == "sql":
-        return code if isinstance(code, str) and code.strip() else _sql_starter_query()
-
     # Python
     if l in {"py", "python", "python3"}:
         if "if __name__" in c:
@@ -9270,17 +9143,14 @@ def _starter_code_for_problem(problem: dict, lang: str) -> str:
 
     Prefer problem['starterCode'] if present (from generator), else fall back to defaults.
     """
-    if str((problem or {}).get("type") or "").strip().lower() == "sql":
-        l = "sql"
-    else:
-        l = (lang or "python").strip().lower()
+    l = (lang or "python").strip().lower()
     sc = (problem or {}).get("starterCode") or (problem or {}).get("starter_code") or {}
     if isinstance(sc, dict):
         cand = sc.get(l)
         if isinstance(cand, str) and cand.strip():
             return _ensure_main_in_starter(cand, l)
         # fallbacks
-        cand = sc.get("sql") or sc.get("python") or sc.get("java") or sc.get("cpp") or sc.get("c")
+        cand = sc.get("python") or sc.get("java") or sc.get("cpp") or sc.get("c")
         if isinstance(cand, str) and cand.strip():
             return _ensure_main_in_starter(cand, l)
     defaults = _default_starter_code()
@@ -9648,252 +9518,6 @@ Rules:
             RECENT_CODING_TITLES.append(tt)
 
     return out
-
-
-def _sql_rows_to_text(rows, columns=None):
-    cols = [str(c) for c in (columns or [])]
-    safe_rows = []
-    for row in (rows or []):
-        if isinstance(row, (list, tuple)):
-            safe_rows.append(["" if v is None else str(v) for v in row])
-        else:
-            safe_rows.append(["" if row is None else str(row)])
-    lines = []
-    if cols:
-        lines.append(" | ".join(cols))
-    if safe_rows:
-        for row in safe_rows:
-            lines.append(" | ".join(row))
-    else:
-        lines.append("(no rows)")
-    return "\n".join(lines)
-
-
-def _normalize_sql_result_rows(rows):
-    out = []
-    for row in (rows or []):
-        if isinstance(row, sqlite3.Row):
-            row = tuple(row)
-        if not isinstance(row, (list, tuple)):
-            row = [row]
-        vals = []
-        for v in row:
-            if v is None:
-                vals.append(None)
-            elif isinstance(v, float):
-                vals.append(round(v, 6))
-            else:
-                vals.append(v)
-        out.append(vals)
-    return out
-
-
-def _execute_sql_query(setup_sql: str, query_sql: str):
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.executescript(setup_sql or "")
-        cur = conn.cursor()
-        cur.execute(query_sql or "")
-        rows = _normalize_sql_result_rows(cur.fetchall())
-        cols = [d[0] for d in (cur.description or [])]
-        return {"columns": cols, "rows": rows}
-    finally:
-        conn.close()
-
-
-def _build_sql_pandas_schema(schema_sql: str, sample_data_sql: str):
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.executescript((schema_sql or "") + "\n" + (sample_data_sql or ""))
-        cur = conn.cursor()
-        table_rows = cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-        ).fetchall()
-        tables = [str(r[0]) for r in table_rows]
-        if not tables:
-            return "import pandas as pd\n"
-        lines = ["import pandas as pd", ""]
-        type_map = {
-            "INT": "Int64",
-            "INTEGER": "Int64",
-            "REAL": "float",
-            "FLOAT": "float",
-            "DOUBLE": "float",
-            "NUMERIC": "float",
-            "DECIMAL": "float",
-            "TEXT": "string",
-            "CHAR": "string",
-            "VARCHAR": "string",
-            "DATE": "string",
-            "DATETIME": "string",
-        }
-        for idx, table in enumerate(tables):
-            pragma_rows = cur.execute(f'PRAGMA table_info("{table}")').fetchall()
-            col_names = [str(r[1]) for r in pragma_rows]
-            col_types = [str(r[2] or "").upper() for r in pragma_rows]
-            rows = cur.execute(f'SELECT * FROM "{table}"').fetchall()
-            data_rows = [list(r) for r in rows]
-            var_name = ''.join(ch if ch.isalnum() else '_' for ch in table.lower()) or 'df'
-            lines.append(f"data = {json.dumps(data_rows, ensure_ascii=False)}")
-            lines.append(f"{var_name} = pd.DataFrame(data, columns={json.dumps(col_names, ensure_ascii=False)})")
-            astype_map = {}
-            for name, ctype in zip(col_names, col_types):
-                dtype = None
-                for key, mapped in type_map.items():
-                    if key in ctype:
-                        dtype = mapped
-                        break
-                if dtype:
-                    astype_map[name] = dtype
-            if astype_map:
-                lines.append(f"{var_name} = {var_name}.astype({json.dumps(astype_map, ensure_ascii=False)})")
-            if idx != len(tables) - 1:
-                lines.append("")
-        return "\n".join(lines).strip() + "\n"
-    finally:
-        conn.close()
-
-
-def _compare_sql_results(actual, expected):
-    a_cols = [str(c) for c in (actual.get("columns") or [])]
-    e_cols = [str(c) for c in (expected.get("columns") or [])]
-    a_rows = actual.get("rows") or []
-    e_rows = expected.get("rows") or []
-    return a_cols == e_cols and a_rows == e_rows
-
-
-def _sql_starter_query():
-    return "-- Write your SQL query below\n-- Tables and data are preloaded for every test dataset.\n\nSELECT 1;\n"
-
-
-def _mocktest_generate_sql_problems(n: int, difficulty: str = "mixed", topic: str = ""):
-    n = max(1, min(40, int(n or 1)))
-    difficulty = (difficulty or "mixed").strip().lower()
-    topic_hint = _sanitize_topic(topic)
-
-    testcase_plan = {
-        "easy": {"samples": 2, "hidden": 1, "marks": 15},
-        "medium": {"samples": 2, "hidden": 3, "marks": 20},
-        "hard": {"samples": 3, "hidden": 3, "marks": 25},
-        "mixed": {"samples": 2, "hidden": 3, "marks": 20},
-    }
-    plan = testcase_plan.get(difficulty, testcase_plan["mixed"])
-    sample_need = int(plan["samples"])
-    hidden_need = int(plan["hidden"])
-
-    prompt = (
-        "You are generating SQL practice problems for a mock/practice test platform.\n"
-        "Return STRICT JSON only with key 'problems' (array).\n"
-        f"Generate exactly {n} SQL problems. Difficulty: {difficulty}.\n"
-        + (f"Focus topic: {topic_hint}.\n" if topic_hint else "")
-        + "Generate SQL problems only. Do NOT generate Python/Java/C++ coding problems.\n"
-        + "Each problem must include these keys: id, title, difficulty, topic, statement, schema_sql, sample_data_sqls, hidden_data_sqls, reference_sql.\n"
-        "Rules:\n"
-        "- Use SQLite-compatible SQL only.\n"
-        "- schema_sql must contain CREATE TABLE statements only.\n"
-        f"- sample_data_sqls must be an array of exactly {sample_need} INSERT-only SQL scripts for visible sample datasets.\n"
-        f"- hidden_data_sqls must be an array of exactly {hidden_need} INSERT-only SQL scripts for hidden datasets.\n"
-        "- reference_sql must be a single SELECT query that solves the problem.\n"
-        "- Keep schemas small: 1 to 3 tables max.\n"
-        "- Make result sets deterministic using explicit ORDER BY in reference_sql.\n"
-    )
-    raw = _gemini_json(prompt) or {}
-    arr = raw.get("problems") if isinstance(raw, dict) else []
-    out = []
-    for i, p in enumerate(arr or [], start=1):
-        if not isinstance(p, dict):
-            continue
-        schema_sql = str(p.get("schema_sql") or "").strip()
-        sample_arr = p.get("sample_data_sqls") or []
-        if not isinstance(sample_arr, list):
-            sample_arr = []
-        sample_arr = [str(x or "").strip() for x in sample_arr if str(x or "").strip()]
-        if not sample_arr:
-            legacy_sample = str(p.get("sample_data_sql") or "").strip()
-            if legacy_sample:
-                sample_arr = [legacy_sample]
-        hidden_arr = p.get("hidden_data_sqls") or []
-        hidden_arr = [str(x or "").strip() for x in hidden_arr if str(x or "").strip()]
-        ref_sql = str(p.get("reference_sql") or "").strip()
-        if not schema_sql or not sample_arr or not hidden_arr or not ref_sql:
-            continue
-
-        if len(sample_arr) < sample_need:
-            sample_arr = (sample_arr * sample_need)[:sample_need]
-        else:
-            sample_arr = sample_arr[:sample_need]
-        if len(hidden_arr) < hidden_need:
-            hidden_arr = (hidden_arr * hidden_need)[:hidden_need]
-        else:
-            hidden_arr = hidden_arr[:hidden_need]
-
-        datasets = []
-        sample_previews = []
-        pandas_seed_sql = sample_arr[0] if sample_arr else ""
-        try:
-            for idx, ssql in enumerate(sample_arr, start=1):
-                sample_res = _execute_sql_query(schema_sql + "\n" + ssql, ref_sql)
-                datasets.append({
-                    "label": f"Sample dataset {idx}",
-                    "setup_sql": ssql,
-                    "expected_columns": sample_res.get("columns") or [],
-                    "expected_rows": sample_res.get("rows") or [],
-                    "hidden": False,
-                })
-                sample_previews.append({
-                    "stdin": ssql,
-                    "expected": _sql_rows_to_text(sample_res.get("rows") or [], sample_res.get("columns") or []),
-                })
-            for idx, hsql in enumerate(hidden_arr, start=1):
-                hidden_res = _execute_sql_query(schema_sql + "\n" + hsql, ref_sql)
-                datasets.append({
-                    "label": f"Hidden dataset {idx}",
-                    "setup_sql": hsql,
-                    "expected_columns": hidden_res.get("columns") or [],
-                    "expected_rows": hidden_res.get("rows") or [],
-                    "hidden": True,
-                })
-        except Exception:
-            continue
-        pid = str(p.get("id") or f"sql_{i}_{uuid.uuid4().hex[:8]}")
-        title = str(p.get("title") or f"SQL Problem {i}").strip() or f"SQL Problem {i}"
-        ptopic = _sanitize_topic(str(p.get("topic") or topic_hint or "SQL")) or "SQL"
-        full_statement = str(p.get("statement") or "").strip()
-        full_statement += "\n\nReturn the final result as a SELECT query only."
-        pdiff = str(p.get("difficulty") or difficulty or "medium").strip().lower() or "medium"
-        plan2 = testcase_plan.get(pdiff, plan)
-        out.append({
-            "id": pid,
-            "title": title,
-            "difficulty": pdiff,
-            "topic": ptopic,
-            "topics": [ptopic, "SQL"],
-            "type": "sql",
-            "statement": full_statement,
-            "inputFormat": "The SQLite database is already prepared using the schema and dataset shown in the prompt.",
-            "constraints": ["Write one SELECT query only", "Use SQLite-compatible syntax", "Use ORDER BY when needed for deterministic output"],
-            "samples": sample_previews,
-            "hiddenTests": [],
-            "starterCode": {"sql": _sql_starter_query()},
-            "solutionHint": "Think about joins, filtering, grouping, or subqueries based on the requirement.",
-            "timeComplexity": "SQL dependent",
-            "spaceComplexity": "SQL dependent",
-            "total_marks": int(plan2["marks"]),
-            "sql_meta": {
-                "schema_sql": schema_sql,
-                "pandas_schema": _build_sql_pandas_schema(schema_sql, pandas_seed_sql),
-                "sample_datasets": [d for d in datasets if not d.get("hidden")],
-                "hidden_datasets": [d for d in datasets if d.get("hidden")],
-                "reference_sql": ref_sql,
-            },
-        })
-    if not out:
-        raise RuntimeError("Gemini did not return any valid SQL problems. Please regenerate.")
-    return out
-
-
 def _mocktest_public_session(doc: dict):
     if not doc:
         return None
@@ -9917,7 +9541,7 @@ def _mocktest_public_session(doc: dict):
         "tech_questions": doc.get("tech_questions") or [],
         "coding_problems": [
             {k: v for k, v in (p or {}).items() if k not in ["referencePython", "referenceJudge0"]}
-            | {"hiddenTestCount": len(((p or {}).get("hiddenTests") or [])) or len((((p or {}).get("sql_meta") or {}).get("hidden_datasets") or [])) or len(((p or {}).get("samples") or [])), "total_marks": (p or {}).get("total_marks")}
+            | {"hiddenTestCount": len(((p or {}).get("hiddenTests") or [])) or len(((p or {}).get("samples") or [])), "total_marks": (p or {}).get("total_marks")}
             for p in (doc.get("coding_problems") or [])
             if isinstance(p, dict)
         ],
@@ -9934,34 +9558,27 @@ def mocktest_create_session():
     mode = (payload.get("mode") or "all").strip().lower()
     difficulty = (payload.get("difficulty") or "mixed").strip().lower()
     pattern = payload.get("pattern") or {}
-    gen_n = max(0, min(40, int(pattern.get("general") or 0)))
-    tech_n = max(0, min(40, int(pattern.get("tech") or 0)))
-    coding_n = max(0, min(20, int(pattern.get("coding") or 0)))
-    sql_n = max(0, min(20, int(pattern.get("sql") or 0)))
+    gen_n = int(pattern.get("general") or 0)
+    tech_n = int(pattern.get("tech") or 0)
+    coding_n = int(pattern.get("coding") or 0)
 
     if mode == "general":
-        tech_n = 0; coding_n = 0; sql_n = 0
+        tech_n = 0; coding_n = 0
     elif mode == "tech":
-        gen_n = 0; coding_n = 0; sql_n = 0
+        gen_n = 0; coding_n = 0
     elif mode == "coding":
-        gen_n = 0; tech_n = 0; sql_n = 0
-    elif mode == "sql":
         gen_n = 0; tech_n = 0
     else:
         mode = "all" 
 
-    if gen_n + tech_n + coding_n + sql_n <= 0:
+    if gen_n + tech_n + coding_n <= 0:
         return jsonify({"error": "Pattern must include at least one question/problem count."}), 400
 
     # Generate content
     try:
         general_qs = _mocktest_generate_apti_questions("general", gen_n, difficulty=difficulty) if gen_n else []
         tech_qs = _mocktest_generate_apti_questions("tech", tech_n, difficulty=difficulty) if tech_n else []
-        requested_dsa_n = coding_n if mode in ["all", "coding"] else 0
-        requested_sql_n = sql_n if mode == "all" else (coding_n if mode == "sql" else 0)
-        dsa_probs = _mocktest_generate_coding_problems(requested_dsa_n, difficulty=difficulty) if requested_dsa_n else []
-        sql_probs = _mocktest_generate_sql_problems(requested_sql_n, difficulty=difficulty, topic="SQL") if requested_sql_n else []
-        coding_probs = (dsa_probs or []) + (sql_probs or [])
+        coding_probs = _mocktest_generate_coding_problems(coding_n, difficulty=difficulty) if coding_n else []
     except Exception as e:
         # Gemini failure should not fall back silently; tell UI to regenerate.
         if is_quota_error(e):
@@ -9980,10 +9597,9 @@ def mocktest_create_session():
         pid = p.get("id") or p.get("slug")
         if not pid:
             continue
-        init_lang = "sql" if str((p.get("type") or "")).strip().lower() == "sql" else "python"
         coding_answers[str(pid)] = {
-            "language": init_lang,
-            "code": (_starter_code_for_problem(p, init_lang) or ""),
+            "language": "python",
+            "code": (_starter_code_for_problem(p, "python") or ""),
         }
 
     doc = {
@@ -9991,7 +9607,7 @@ def mocktest_create_session():
         "session_id": str(uuid.uuid4()),
         "title": (payload.get("title") or "Mock Test").strip() or "Mock Test",
         "mode": mode,
-        "pattern": {"general": gen_n, "tech": tech_n, "coding": (coding_n if mode in ["all", "coding"] else 0), "sql": (sql_n if mode == "all" else (coding_n if mode == "sql" else 0))},
+        "pattern": {"general": gen_n, "tech": tech_n, "coding": coding_n},
         "difficulty": difficulty,
         "kind": "mock",
         "status": "ready",
@@ -10024,7 +9640,7 @@ def practice_create_session():
 
     payload = request.get_json(silent=True) or {}
     section = (payload.get("section") or "general").strip().lower()
-    if section not in ["general", "tech", "dsa", "mixed", "sql"]:
+    if section not in ["general", "tech", "dsa", "mixed"]:
         section = "general"
     difficulty = (payload.get("difficulty") or "easy").strip().lower()
     if difficulty not in ["easy", "mixed", "medium", "hard"]:
@@ -10032,58 +9648,47 @@ def practice_create_session():
     topic = _sanitize_topic(payload.get("topic") or "")
     count = int(payload.get("count") or 0)
 
-    # Mixed practice can generate General + Tech + Coding + SQL together with per-area topics.
+    # Mixed practice can generate General + Tech + Coding together with per-area topics.
     topics = payload.get("topics") or {}
     counts = payload.get("counts") or {}
 
     if section == "mixed":
-        gcount = max(0, min(40, int(counts.get("general") or 0)))
-        tcount = max(0, min(40, int(counts.get("tech") or 0)))
-        ccount = max(0, min(20, int(counts.get("coding") or 0)))
-        scount = max(0, min(20, int(counts.get("sql") or 0)))
-        if gcount + tcount + ccount + scount <= 0:
-            return jsonify({"error": "Please enter at least one question/problem count."}), 400
+        gcount = int(counts.get("general") or 10)
+        tcount = int(counts.get("tech") or 10)
+        ccount = int(counts.get("coding") or 2)
+        gcount = max(5, min(40, gcount))
+        tcount = max(5, min(40, tcount))
+        ccount = max(1, min(10, ccount))
     elif section == "dsa":
-        count = max(1, min(20, count or 1))
-    elif section == "sql":
-        count = max(1, min(20, count or 1))
+        count = max(1, min(10, count or 2))
     else:
-        count = max(1, min(40, count or 1))
+        count = max(5, min(40, count or 10))
 
     try:
         if section == "mixed":
             gtopic = _sanitize_topic(str(topics.get("general") or ""))
             ttopic = _sanitize_topic(str(topics.get("tech") or ""))
             ctopic = _sanitize_topic(str(topics.get("coding") or ""))
-            stopic = _sanitize_topic(str(topics.get("sql") or ""))
             general_qs = _mocktest_generate_apti_questions("general", gcount, difficulty=difficulty, topic=gtopic) if gcount else []
             tech_qs = _mocktest_generate_apti_questions("tech", tcount, difficulty=difficulty, topic=ttopic) if tcount else []
-            dsa_probs = _mocktest_generate_coding_problems(ccount, difficulty=difficulty, topic=ctopic) if ccount else []
-            sql_probs = _mocktest_generate_sql_problems(scount, difficulty=difficulty, topic=stopic or "SQL") if scount else []
-            coding_probs = (dsa_probs or []) + (sql_probs or [])
-            pattern = {"general": gcount, "tech": tcount, "coding": ccount, "sql": scount}
+            coding_probs = _mocktest_generate_coding_problems(ccount, difficulty=difficulty, topic=ctopic) if ccount else []
+            pattern = {"general": gcount, "tech": tcount, "coding": ccount}
             mode = "all"
             # store structured topics for mixed
-            topic = {"general": gtopic, "tech": ttopic, "coding": ctopic, "sql": stopic}
+            topic = {"general": gtopic, "tech": ttopic, "coding": ctopic}
         elif section in ["general", "tech"]:
             generated_qs = _mocktest_generate_apti_questions(section, count, difficulty=difficulty, topic=topic) if count else []
             general_qs = generated_qs if section == "general" else []
             tech_qs = generated_qs if section == "tech" else []
             coding_probs = []
-            pattern = {"general": count if section == "general" else 0, "tech": count if section == "tech" else 0, "coding": 0, "sql": 0}
+            pattern = {"general": count if section == "general" else 0, "tech": count if section == "tech" else 0, "coding": 0}
             mode = section
-        elif section == "dsa":
-            general_qs = []
-            tech_qs = []
-            coding_probs = _mocktest_generate_coding_problems(count, difficulty=difficulty, topic=topic) if count else []
-            pattern = {"general": 0, "tech": 0, "coding": count, "sql": 0}
-            mode = "coding"
         else:
             general_qs = []
             tech_qs = []
-            coding_probs = _mocktest_generate_sql_problems(count, difficulty=difficulty, topic=topic or "SQL") if count else []
-            pattern = {"general": 0, "tech": 0, "coding": 0, "sql": count}
-            mode = "sql"
+            coding_probs = _mocktest_generate_coding_problems(count, difficulty=difficulty, topic=topic) if count else []
+            pattern = {"general": 0, "tech": 0, "coding": count}
+            mode = "coding"
     except Exception as e:
         if is_quota_error(e):
             return jsonify({"error": "Quota exceeded for the Gemini API. Please try again later.", "code": "QUOTA_EXCEEDED"}), 429
@@ -10110,8 +9715,8 @@ def practice_create_session():
             "tech": {},
             "coding": {
                 str((p.get("id") or p.get("slug"))): {
-                    "language": ("sql" if str((p.get("type") or "")).strip().lower() == "sql" else "python"),
-                    "code": _starter_code_for_problem(p, ("sql" if str((p.get("type") or "")).strip().lower() == "sql" else "python")) or "",
+                    "language": "python",
+                    "code": _starter_code_for_problem(p, "python") or "",
                 }
                 for p in (coding_probs or [])
                 if isinstance(p, dict) and (p.get("id") or p.get("slug"))
@@ -10241,70 +9846,28 @@ def mocktest_code_run():
     t0 = time.time()
 
     results = []
-    if (payload.get("problem_type") or "").strip().lower() == "sql" or language == "sql":
-        for t in tests[:4]:
-            if not isinstance(t, dict):
-                continue
-            schema_sql = str(payload.get("schema_sql") or t.get("schema_sql") or "")
-            setup_sql = str(t.get("setup_sql") or "")
-            expected = {"columns": t.get("expected_columns") or [], "rows": t.get("expected_rows") or []}
-            try:
-                actual = _execute_sql_query((schema_sql + "\n" + setup_sql).strip(), source_code)
-                passed = _compare_sql_results(actual, expected)
-                r = {
-                    "stdout": _sql_rows_to_text(actual.get("rows") or [], actual.get("columns") or []),
-                    "stderr": "",
-                    "compile_output": "",
-                    "status": "Accepted" if passed else "Wrong Answer",
-                    "status_id": 3 if passed else 4,
-                    "expected": _sql_rows_to_text(expected.get("rows") or [], expected.get("columns") or []),
-                    "expected_columns": expected.get("columns") or [],
-                    "expected_rows": expected.get("rows") or [],
-                    "actual_columns": actual.get("columns") or [],
-                    "actual_rows": actual.get("rows") or [],
-                    "is_sql": True,
-                    "passed": passed,
-                }
-            except Exception as e:
-                r = {
-                    "stdout": "",
-                    "stderr": str(e),
-                    "compile_output": "",
-                    "status": "Error",
-                    "status_id": 13,
-                    "expected": _sql_rows_to_text(expected.get("rows") or [], expected.get("columns") or []),
-                    "expected_columns": expected.get("columns") or [],
-                    "expected_rows": expected.get("rows") or [],
-                    "actual_columns": [],
-                    "actual_rows": [],
-                    "is_sql": True,
-                    "passed": False,
-                }
-            r["stdin"] = ((schema_sql + "\n" + setup_sql).strip() if schema_sql else setup_sql)
-            results.append(r)
-    else:
-        for t in tests[:4]:
-            if not isinstance(t, dict):
-                continue
-            stdin = t.get("stdin") or ""
-            expected = t.get("expected")
-            try:
-                r = _code_run(source_code, stdin, language, expected=expected)
-            except Exception as e:
-                r = {
-                    "stdout": "",
-                    "stderr": str(e),
-                    "compile_output": "",
-                    "status": "Error",
-                    "status_id": 13,
-                    "expected": (expected or "").strip() if expected is not None else "",
-                    "passed": False,
-                }
-            r["stdin"] = t.get("stdin","")
-            results.append(r)
+    for t in tests[:4]:
+        if not isinstance(t, dict):
+            continue
+        stdin = t.get("stdin") or ""
+        expected = t.get("expected")
+        try:
+            r = _code_run(source_code, stdin, language, expected=expected)
+        except Exception as e:
+            r = {
+                "stdout": "",
+                "stderr": str(e),
+                "compile_output": "",
+                "status": "Error",
+                "status_id": 13,
+                "expected": (expected or "").strip() if expected is not None else "",
+                "passed": False,
+            }
+        r["stdin"] = t.get("stdin","")
+        results.append(r)
 
     wall_ms = int((time.time() - t0) * 1000)
-    analysis = {} if ((payload.get("problem_type") or "").strip().lower() == "sql" or language == "sql") else _gemini_code_analysis(payload.get("problem_text") or payload.get("problem") or "", source_code, language)
+    analysis = _gemini_code_analysis(payload.get("problem_text") or payload.get("problem") or "", source_code, language)
     # Build per-testcase details (all are public for Run)
     testcases = []
     passed_count = 0
@@ -10322,11 +9885,6 @@ def mocktest_code_run():
             "stderr": r.get("stderr", ""),
             "time_ms": r.get("time_ms"),
             "memory_kb": r.get("memory_kb"),
-            "expected_columns": r.get("expected_columns") or [],
-            "expected_rows": r.get("expected_rows") or [],
-            "actual_columns": r.get("actual_columns") or [],
-            "actual_rows": r.get("actual_rows") or [],
-            "is_sql": bool(r.get("is_sql")),
         })
 
     return jsonify({
@@ -10377,9 +9935,8 @@ def mocktest_submit_single_coding(session_id, pid):
     if not prob:
         return jsonify({"error": "Problem not found"}), 404
 
-    is_sql_problem = str((prob or {}).get("type") or "").strip().lower() == "sql"
-    tests_samples = ((prob.get("sql_meta") or {}).get("sample_datasets") or []) if is_sql_problem else (prob.get("samples") or [])
-    tests_hidden = ((prob.get("sql_meta") or {}).get("hidden_datasets") or []) if is_sql_problem else (prob.get("hiddenTests") or [])
+    tests_samples = prob.get("samples") or []
+    tests_hidden = prob.get("hiddenTests") or []
 
     def _norm_tests(arr):
         out = []
@@ -10393,8 +9950,8 @@ def mocktest_submit_single_coding(session_id, pid):
             out.append({"stdin": str(stdin), "expected": str(expected)})
         return out
 
-    tests_samples_n = tests_samples if is_sql_problem else _norm_tests(tests_samples)
-    tests_hidden_n = tests_hidden if is_sql_problem else _norm_tests(tests_hidden)
+    tests_samples_n = _norm_tests(tests_samples)
+    tests_hidden_n = _norm_tests(tests_hidden)
 
     # Preserve whether a testcase is sample/hidden for frontend.
     tests = (
@@ -10415,29 +9972,7 @@ def mocktest_submit_single_coding(session_id, pid):
         is_sample = not hidden
 
         try:
-            if is_sql_problem:
-                setup_sql = t.get("setup_sql") or ""
-                expected_obj = {"columns": t.get("expected_columns") or [], "rows": t.get("expected_rows") or []}
-                actual = _execute_sql_query((prob.get("sql_meta") or {}).get("schema_sql") + "\n" + setup_sql, source_code)
-                passed_sql = _compare_sql_results(actual, expected_obj)
-                r = {
-                    "stdout": _sql_rows_to_text(actual.get("rows") or [], actual.get("columns") or []),
-                    "stderr": "",
-                    "compile_output": "",
-                    "status": "Accepted" if passed_sql else "Wrong Answer",
-                    "status_id": 3 if passed_sql else 4,
-                    "expected": _sql_rows_to_text(expected_obj.get("rows") or [], expected_obj.get("columns") or []),
-                    "expected_columns": expected_obj.get("columns") or [],
-                    "expected_rows": expected_obj.get("rows") or [],
-                    "actual_columns": actual.get("columns") or [],
-                    "actual_rows": actual.get("rows") or [],
-                    "is_sql": True,
-                    "passed": passed_sql,
-                }
-                stdin = setup_sql
-                expected = r.get("expected")
-            else:
-                r = _code_run(source_code, stdin, language, expected=expected)
+            r = _code_run(source_code, stdin, language, expected=expected)
         except Exception as e:
             r = {
                 "stdout": "",
@@ -10448,12 +9983,6 @@ def mocktest_submit_single_coding(session_id, pid):
                 "expected": (expected or "").strip() if expected is not None else "",
                 "passed": False,
             }
-            if is_sql_problem:
-                r["expected_columns"] = (expected_obj.get("columns") or []) if isinstance(locals().get("expected_obj"), dict) else []
-                r["expected_rows"] = (expected_obj.get("rows") or []) if isinstance(locals().get("expected_obj"), dict) else []
-                r["actual_columns"] = []
-                r["actual_rows"] = []
-                r["is_sql"] = True
 
         # Attach testcase metadata for frontend rendering
         r["id"] = i
@@ -10502,19 +10031,18 @@ def mocktest_submit_single_coding(session_id, pid):
     # Best-effort complexity estimation (especially for fallback-bank problems
     # that may not include Big-O metadata).
     tc_analysis = None
-    if not is_sql_problem:
-        try:
-            if not (prob.get("timeComplexity") or prob.get("time_complexity") or prob.get("spaceComplexity") or prob.get("space_complexity")):
-                ptxt = (
-                    f"{prob.get('title') or ''}\n"
-                    f"{prob.get('statement') or ''}\n\n"
-                    f"Input Format:\n{prob.get('inputFormat') or ''}\n\n"
-                    f"Output Format:\n{prob.get('outputFormat') or ''}\n\n"
-                    f"Constraints:\n" + "\n".join([str(x) for x in (prob.get('constraints') or [])])
-                )
-                tc_analysis = _gemini_code_analysis(ptxt, source_code, language) or None
-        except Exception:
-            tc_analysis = None
+    try:
+        if not (prob.get("timeComplexity") or prob.get("time_complexity") or prob.get("spaceComplexity") or prob.get("space_complexity")):
+            ptxt = (
+                f"{prob.get('title') or ''}\n"
+                f"{prob.get('statement') or ''}\n\n"
+                f"Input Format:\n{prob.get('inputFormat') or ''}\n\n"
+                f"Output Format:\n{prob.get('outputFormat') or ''}\n\n"
+                f"Constraints:\n" + "\n".join([str(x) for x in (prob.get('constraints') or [])])
+            )
+            tc_analysis = _gemini_code_analysis(ptxt, source_code, language) or None
+    except Exception:
+        tc_analysis = None
 
     summary = {
         "passed": passed,
@@ -10529,9 +10057,9 @@ def mocktest_submit_single_coding(session_id, pid):
         "full_marks": full_marks,
         "at": utc_iso() + "Z",
         "wall_time_ms": int((time.time() - t0) * 1000),
-        "timeComplexity": None if is_sql_problem else (prob.get("timeComplexity") or prob.get("time_complexity") or (tc_analysis.get("timeComplexity") if isinstance(tc_analysis, dict) else None)),
-        "spaceComplexity": None if is_sql_problem else (prob.get("spaceComplexity") or prob.get("space_complexity") or (tc_analysis.get("spaceComplexity") if isinstance(tc_analysis, dict) else None)),
-        "analysis": None if is_sql_problem else (tc_analysis.get("analysis") if isinstance(tc_analysis, dict) else None),
+        "timeComplexity": prob.get("timeComplexity") or prob.get("time_complexity") or (tc_analysis.get("timeComplexity") if isinstance(tc_analysis, dict) else None),
+        "spaceComplexity": prob.get("spaceComplexity") or prob.get("space_complexity") or (tc_analysis.get("spaceComplexity") if isinstance(tc_analysis, dict) else None),
+        "analysis": (tc_analysis.get("analysis") if isinstance(tc_analysis, dict) else None),
     }
 
     try:
@@ -10570,7 +10098,7 @@ def mocktest_submit_single_coding(session_id, pid):
         # total_marks: for coding sessions use sum of per-problem marks; otherwise add aptitude MCQs too.
         mode2 = (updated.get("mode") or "").lower()
         base_q = int((updated.get("pattern") or {}).get("general") or 0) + int((updated.get("pattern") or {}).get("tech") or 0)
-        total_marks = c_total_marks if mode2 in ["coding", "sql"] else base_q + c_total_marks
+        total_marks = c_total_marks if mode2 == "coding" else base_q + c_total_marks
         total_score = (int(scores.get("general") or 0) + int(scores.get("tech") or 0) + int(scores.get("coding") or 0))
 
         col.update_one({"_id": updated.get("_id")}, {"$set": {"scores": scores, "total_score": total_score, "total_marks": total_marks, "updated_at": datetime.utcnow()}})
@@ -10688,11 +10216,9 @@ def mocktest_proctoring_violation(session_id):
                         f"<p><b>Violation count:</b> {new_count}/{limit}</p>"
                         f"<p><b>Last violation time:</b> {_html_escape(_fmt_ist(now_dt))}</p>"
                         f"<p>Please stay on the Zenith mock test screen during future attempts.</p>"
-                        + _proctoring_details_html(proctoring)
                     ),
                     cta_url="/my-tests?tab=mock",
                     cta_text="Open Mock Test History",
-                    kind="mocktest",
                 )
                 _send_email(
                     to_email,
@@ -10702,7 +10228,6 @@ def mocktest_proctoring_violation(session_id):
                         f"Your mock test '{doc.get('title') or 'Mock Test'}' was auto-submitted with 0 marks due to proctoring violations.\n"
                         f"Violation count: {new_count}/{limit}\n"
                         f"Last violation time: {_fmt_ist(now_dt)}\n"
-                        + _proctoring_details_text(proctoring)
                     ),
                     kind="mocktest",
                     reply_to=(os.getenv("CONTACT_INBOX") or os.getenv("ADMIN_EMAIL")),
@@ -10800,9 +10325,8 @@ def mocktest_submit(session_id):
         coding_total_marks += full_marks
 
         # Final submit should validate BOTH samples + hidden (Run => samples, Submit => samples + hidden)
-        is_sql_problem = str((p or {}).get("type") or "").strip().lower() == "sql"
-        samples = ((p.get("sql_meta") or {}).get("sample_datasets") or []) if is_sql_problem else (p.get("samples") or [])
-        hidden = ((p.get("sql_meta") or {}).get("hidden_datasets") or []) if is_sql_problem else (p.get("hiddenTests") or [])
+        samples = p.get("samples") or []
+        hidden = p.get("hiddenTests") or []
         tests = list(samples) + list(hidden)
         tests = [t for t in tests if isinstance(t, dict)]
 
@@ -10840,18 +10364,7 @@ def mocktest_submit(session_id):
 
         for idx, t in enumerate(tests):
             try:
-                if is_sql_problem:
-                    actual = _execute_sql_query(((p.get("sql_meta") or {}).get("schema_sql") or "") + "\n" + (t.get("setup_sql") or ""), code)
-                    expected_obj = {"columns": t.get("expected_columns") or [], "rows": t.get("expected_rows") or []}
-                    ok_sql = _compare_sql_results(actual, expected_obj)
-                    jr = {
-                        "passed": ok_sql,
-                        "stdout": _sql_rows_to_text(actual.get("rows") or [], actual.get("columns") or []),
-                        "expected": _sql_rows_to_text(expected_obj.get("rows") or [], expected_obj.get("columns") or []),
-                        "status": "Accepted" if ok_sql else "Wrong Answer",
-                    }
-                else:
-                    jr = _code_run(code, t.get("stdin") or "", lang, expected=(t.get("expected") or ""))
+                jr = _code_run(code, t.get("stdin") or "", lang, expected=(t.get("expected") or ""))
             except Exception as e:
                 jr = {"passed": False, "error": str(e)}
             item = {k: jr.get(k) for k in ["passed", "stdout", "expected", "stderr", "compile_output", "status", "time", "memory"] if k in jr}
@@ -11009,7 +10522,6 @@ Guidelines:
                 or (doc.get("selected_difficulty") or "")
             ).strip()
 
-            test_name = _sanitize_test_name_for_email(test_name, is_practice=(doc.get("kind") or "mock").strip().lower() == "practice")
             test_name_display = f"{test_name} ({test_difficulty.title()})" if test_difficulty else test_name
 
             # ✅ Date formatting (IST)
@@ -11142,9 +10654,6 @@ Guidelines:
             cta_text = "View Practice Test History" if is_practice else "View Mock Test History"
             cta_url = "/my-tests?tab=practice" if is_practice else "/my-tests?tab=mock"
 
-            proctoring_block_html = "" if is_practice else _proctoring_details_html(doc.get("proctoring") or {})
-            proctoring_block_text = "" if is_practice else _proctoring_details_text(doc.get("proctoring") or {})
-
             body_html = (
                 ("<p>Your practice test has been evaluated and your report is ready ✅</p>" if is_practice else "<p>Your mock test has been evaluated and your report is ready ✅</p>")
                 + "<ul>" + "".join(score_items) + "</ul>"
@@ -11153,7 +10662,6 @@ Guidelines:
                     f"<p><b>🗓️ Test Created:</b> {_html_escape(created_str)}<br/>"
                     f"<b>⏰ Submitted:</b> {_html_escape(submitted_str)}</p><hr/>"
                 ))
-                + proctoring_block_html
                 + "<p style='margin-top:12px'>Open Zenith to review your detailed analysis, mistakes, and recommendations.</p>"
             )
 
@@ -11163,7 +10671,6 @@ Guidelines:
                 body_html=body_html,
                 cta_url=cta_url,
                 cta_text=cta_text,
-                kind=("practicetest" if is_practice else "mocktest"),
             )
 
             email_sent = bool(
@@ -11180,7 +10687,6 @@ Guidelines:
                         + (f"Technical: {tech_score}/{len(tech_qs)}\n" if len(tech_qs) > 0 else "")
                         + (f"Coding: {coding_score}/{coding_total_marks}\n" if (coding_total_marks or 0) > 0 else "")
                         + (f"\nSummary: {summ}\n" if summ else "")
-                        + proctoring_block_text
                     ),
                     kind=("practicetest" if is_practice else "mocktest"),
                     reply_to=(os.getenv("CONTACT_INBOX") or os.getenv("ADMIN_EMAIL")),
@@ -11232,20 +10738,11 @@ def _case_to_public_dict(case, hide_io=False):
         d["expected"] = ""
         d["stdout"] = ""
         d["stderr"] = (case.get("stderr") or "")
-        d["expected_columns"] = []
-        d["expected_rows"] = []
-        d["actual_columns"] = []
-        d["actual_rows"] = []
     else:
         d["stdin"] = (case.get("stdin") or "")
         d["expected"] = (case.get("expected") or "")
         d["stdout"] = (case.get("stdout") or "")
         d["stderr"] = (case.get("stderr") or "")
-        d["expected_columns"] = (case.get("expected_columns") or [])
-        d["expected_rows"] = (case.get("expected_rows") or [])
-        d["actual_columns"] = (case.get("actual_columns") or [])
-        d["actual_rows"] = (case.get("actual_rows") or [])
-    d["is_sql"] = bool(case.get("is_sql"))
     return d
 if __name__ == "__main__":
     app.run(debug=True)
