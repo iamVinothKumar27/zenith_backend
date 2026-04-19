@@ -4166,7 +4166,7 @@ def parse_roadmap(roadmap: str):
 def get_video_details(query, max_results=2, retries=3, delay=2):
     """
     Returns list of videos for a query with like_count.
-    ✅ Also prints fetching details similar to your old code.
+    If YouTube API fails, returns [] instead of crashing the whole roadmap flow.
     """
     video_details = []
     results_count = 0
@@ -4177,12 +4177,14 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
     print(f"Query: {query} | max_results={max_results}")
     print(f"========================================\n")
 
+    if not YOUTUBE_API_KEY:
+        print("[YOUTUBE CONFIG] Missing YOUTUBE_API_KEY. Returning empty video list.")
+        return video_details
+
     while results_count < max_results:
         page_no += 1
         try:
             print(f"[SEARCH] page={page_no} results_so_far={results_count} token={next_page_token}")
-            # Extra guard to reduce Shorts appearing in search results.
-            # (We still hard-filter by duration + title in _looks_like_shorts.)
             safe_query = f"{query} -shorts -#shorts" if query else query
             search_response = youtube.search().list(
                 q=safe_query,
@@ -4206,15 +4208,12 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
                 published = item.get("snippet", {}).get("publishedAt", "")
                 video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-                # Defaults (in case API omits fields)
                 duration_sec = 0
                 iso_dur = ""
-                _skip_shorts = False
-
-
-                # Fetch video statistics with retry
+                skip_shorts = False
                 stats = {}
                 last_err = None
+
                 for attempt in range(1, retries + 1):
                     try:
                         print(f"  [STATS] attempt={attempt}/{retries} id={video_id}")
@@ -4229,29 +4228,33 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
                             iso_dur = (content_details.get("duration") or "").strip()
                             duration_sec = _parse_iso8601_duration_to_seconds(iso_dur)
 
-                            # Filter Shorts / very short videos
                             if _looks_like_shorts(title, duration_sec, video_url):
                                 print(f"  [SKIP-SHORTS] id={video_id} dur={duration_sec}s title={title[:60]}")
                                 stats = {}
-                                _skip_shorts = True
-                            else:
-                                _skip_shorts = False
+                                skip_shorts = True
                             break
                     except HttpError as e:
                         last_err = e
-                        if e.resp.status in [500, 503]:
+                        status = getattr(getattr(e, "resp", None), "status", None)
+                        if status in [500, 503]:
                             sleep_s = delay * attempt
-                            print(f"  [STATS-RETRY] status={e.resp.status} sleeping={sleep_s}s")
+                            print(f"  [STATS-RETRY] status={status} sleeping={sleep_s}s")
                             time.sleep(sleep_s)
-                        else:
-                            raise
+                            continue
+                        print(f"  [STATS-ERROR] id={video_id} status={status} err={e}")
+                        stats = {}
+                        break
+                    except Exception as e:
+                        last_err = e
+                        print(f"  [STATS-ERROR] id={video_id} err={e}")
+                        stats = {}
+                        break
 
-                if last_err and not stats:
+                if last_err and not stats and not skip_shorts:
                     print(f"  [STATS-FAIL] id={video_id} err={str(last_err)}")
                     continue
 
-                # If we skipped due to Shorts, continue
-                if locals().get('_skip_shorts'):
+                if skip_shorts:
                     continue
 
                 like_count = int(stats.get("likeCount", 0) or 0)
@@ -4271,7 +4274,6 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
                     "duration_iso": iso_dur
                 })
 
-                # ✅ This print line matches your older style
                 print(query, " [", results_count, "] : ", video_details[-1])
 
                 results_count += 1
@@ -4284,11 +4286,16 @@ def get_video_details(query, max_results=2, retries=3, delay=2):
                 break
 
         except HttpError as e:
-            if e.resp.status in [500, 503]:
-                print(f"[SEARCH-RETRY] status={e.resp.status} sleeping={delay}s")
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if status in [500, 503]:
+                print(f"[SEARCH-RETRY] status={status} sleeping={delay}s")
                 time.sleep(delay)
                 continue
-            raise
+            print(f"[YOUTUBE SEARCH ERROR] status={status} err={e}")
+            break
+        except Exception as e:
+            print(f"[YOUTUBE SEARCH ERROR] err={e}")
+            break
 
     print(f"\n========== YOUTUBE FETCH END ==========")
     print(f"Query: {query} | fetched={len(video_details)}")
@@ -4347,21 +4354,25 @@ def build_weekly_json(roadmap):
             print(f"  -> ({idx}) Topic: {topic}")
             print(f"     Query: {q}")
 
-            cur_kw = _extract_topic_keywords(topic)
-            blocked = covered_keywords - cur_kw
+            try:
+                cur_kw = _extract_topic_keywords(topic)
+                blocked = covered_keywords - cur_kw
 
-            best = get_best_video(q, used_video_ids=used_video_ids, blocked_keywords=blocked)
+                best = get_best_video(q, used_video_ids=used_video_ids, blocked_keywords=blocked)
 
-            if best and best.get("url"):
-                url = best["url"]
-                vid = best.get("video_id") or _yt_id(url)
-                if vid:
-                    used_video_ids.add(vid)
-            else:
-                url = None
+                if best and best.get("url"):
+                    url = best["url"]
+                    vid = best.get("video_id") or _yt_id(url)
+                    if vid:
+                        used_video_ids.add(vid)
+                else:
+                    url = None
 
-            week_data.append({"topic": topic, "video": url if url else "No video found"})
-            covered_keywords |= cur_kw
+                week_data.append({"topic": topic, "video": url if url else "No video found"})
+                covered_keywords |= cur_kw
+            except Exception as e:
+                print(f"[TOPIC VIDEO ERROR] topic={topic} err={e}")
+                week_data.append({"topic": topic, "video": "No video found"})
 
         result.append({week: week_data})
 
