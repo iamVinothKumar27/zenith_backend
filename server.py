@@ -141,6 +141,7 @@ def _proctoring_public(data):
             continue
         cleaned_events.append({
             "type": e.get("type") or "warning",
+            "description": e.get("description") or "",
             "at": _ensure_iso_tz(e.get("at")) if isinstance(e.get("at"), str) else e.get("at"),
             "at_ist": e.get("at_ist") or "",
         })
@@ -10619,13 +10620,27 @@ def mocktest_proctoring_violation(session_id):
     now_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
     now_iso = now_dt.isoformat()
     new_count = int(current.get("violations") or 0) + 1
+
+    _violation_messages = {
+        "tab-hidden":        "Tab or window switch detected",
+        "tab-switch":        "Tab switching detected",
+        "window-blur":       "Window focus lost (possible tab switch)",
+        "fullscreen-exit":   "Exited fullscreen mode",
+        "camera-off":        "Camera disconnected or turned off",
+        "copy-paste":        "Copy / paste attempt blocked",
+        "right-click":       "Right-click attempt blocked",
+        "keyboard-shortcut": "Blocked keyboard shortcut attempt",
+        "screen-switch":     "Screen switching detected",
+    }
+    violation_desc = _violation_messages.get(event_type, f"Proctoring violation ({event_type})")
     warning = {
-        "message": f"Warning {new_count}/{limit}: screen switching detected.",
+        "message": f"Warning {new_count}/{limit}: {violation_desc}.",
         "at": now_iso,
         "at_ist": _fmt_ist(now_dt),
     }
     event = {
         "type": event_type,
+        "description": violation_desc,
         "at": now_iso,
         "at_ist": _fmt_ist(now_dt),
     }

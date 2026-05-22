@@ -2,116 +2,128 @@
   {
     "Week 1": [
       {
-        "topic": "circular linked list Data Structures implementation",
-        "video": "https://www.youtube.com/watch?v=HMkdlu5sP4A"
+        "topic": "What is Mobile Development architecture explained",
+        "video": "https://www.youtube.com/watch?v=WvwQal6WYJ0"
       },
       {
-        "topic": "doubly linked list Data Structures reverse recursive",
-        "video": "https://www.youtube.com/watch?v=63HJ2-jV6Mk"
+        "topic": "Setting up Android Studio Mobile Development environment",
+        "video": "https://www.youtube.com/watch?v=sYh8or9zq0M"
       },
       {
-        "topic": "Data Structures array vs arraylist performance analysis",
-        "video": "https://www.youtube.com/watch?v=ft0owvS5tQA"
+        "topic": "Your first Android Mobile Development app tutorial",
+        "video": "https://www.youtube.com/watch?v=yye7rSsiV6k"
       },
       {
-        "topic": "advanced Data Structures array manipulation techniques",
-        "video": "https://www.youtube.com/watch?v=bxRVz8zklWM"
+        "topic": "Android Mobile Development project structure explained",
+        "video": "https://www.youtube.com/watch?v=-xTqfilaYow"
       },
       {
-        "topic": "Data Structures stack problems for interviews",
-        "video": "https://www.youtube.com/watch?v=cQWr9DFE1ww"
+        "topic": "Android Mobile Development UI layout basics",
+        "video": "https://www.youtube.com/watch?v=OIMTj35i0HU"
       },
       {
-        "topic": "implement Data Structures queue using two stacks",
-        "video": "https://www.youtube.com/watch?v=sFvP5Ois0CE"
+        "topic": "Handling button clicks in Android Mobile Development",
+        "video": "https://www.youtube.com/watch?v=Qb8Wvo9u5zE"
       },
       {
-        "topic": "min heap max heap Data Structures complexities",
-        "video": "https://www.youtube.com/watch?v=j6iP4lDTKyI"
+        "topic": "Simple Android Mobile Development text display",
+        "video": "https://www.youtube.com/watch?v=ER1AHNJmxSI"
+      }
+    ]
+  },
+  {
+    "Week 2": [
+      {
+        "topic": "Android Mobile Development list view RecyclerView tutorial",
+        "video": "https://www.youtube.com/watch?v=HtwDXRWjMcU"
       },
       {
-        "topic": "priority queue Data Structures advanced applications",
-        "video": "https://www.youtube.com/watch?v=m9SVfOYTaBQ"
+        "topic": "Navigating between Android Mobile Development screens",
+        "video": "https://www.youtube.com/watch?v=BUXnASp_WyQ"
       },
       {
-        "topic": "AVL tree Data Structures rotations explained",
-        "video": "https://www.youtube.com/watch?v=zP2xbKerIds"
+        "topic": "Android Mobile Development Fragments deep dive",
+        "video": "https://www.youtube.com/watch?v=Fi3_BjVzpqk"
       },
       {
-        "topic": "red black tree Data Structures insertion deletion visualization",
-        "video": "https://www.youtube.com/watch?v=94ErZ5K8XZg"
+        "topic": "Passing data between Android Mobile Development Activities",
+        "video": "https://www.youtube.com/watch?v=UOvziSyhoHs"
       },
       {
-        "topic": "segment tree Data Structures range query update",
-        "video": "https://www.youtube.com/watch?v=CWDQJGaN1gY"
+        "topic": "User input forms in Android Mobile Development",
+        "video": "https://www.youtube.com/watch?v=0QqAkopW31M"
       },
       {
-        "topic": "trie Data Structures autocomplete implementation",
-        "video": "https://www.youtube.com/watch?v=zIjfhVPRZCg"
+        "topic": "Android Mobile Development Activity lifecycle explained",
+        "video": "https://www.youtube.com/watch?v=kp-oGImpO_c"
       },
       {
-        "topic": "Dijkstra's algorithm Data Structures shortest path",
-        "video": "https://www.youtube.com/watch?v=Gd92jSu_cZk"
+        "topic": "Practical Android Mobile Development UI examples",
+        "video": "No video found"
+      }
+    ]
+  },
+  {
+    "Week 3": [
+      {
+        "topic": "Android Mobile Development local data storage SharedPreferences",
+        "video": "No video found"
       },
       {
-        "topic": "Floyd Warshall algorithm Data Structures all pairs shortest path",
-        "video": "https://www.youtube.com/watch?v=i9SZKy2yTZw"
+        "topic": "SQLite database tutorial Android Mobile Development",
+        "video": "No video found"
       },
       {
-        "topic": "minimum spanning tree Data Structures Kruskal's Prim's",
-        "video": "https://www.youtube.com/watch?v=h6cUkkaKNHw"
+        "topic": "How to fetch data from API Android Mobile Development Retrofit",
+        "video": "No video found"
       },
       {
-        "topic": "topological sort Data Structures cycle detection",
-        "video": "https://www.youtube.com/watch?v=ChxA6H2253I"
+        "topic": "Displaying network data in Android Mobile Development",
+        "video": "No video found"
       },
       {
-        "topic": "collision resolution techniques Data Structures open addressing",
-        "video": "https://www.youtube.com/watch?v=j612Fj-mgCY"
+        "topic": "Error handling network requests Android Mobile Development",
+        "video": "No video found"
       },
       {
-        "topic": "custom hash function Data Structures implementation guide",
-        "video": "https://www.youtube.com/watch?v=0wFI04w345k"
+        "topic": "Android Mobile Development background tasks explanation",
+        "video": "No video found"
       },
       {
-        "topic": "disjoint set union find Data Structures path compression by rank",
-        "video": "https://www.youtube.com/watch?v=xxHKEnHjLyw"
+        "topic": "Requesting permissions in Android Mobile Development",
+        "video": "https://www.youtube.com/watch?v=K9F7d2_xLEo"
+      }
+    ]
+  },
+  {
+    "Week 4": [
+      {
+        "topic": "Build a complete Android Mobile Development project example",
+        "video": "No video found"
       },
       {
-        "topic": "union by rank Data Structures find by path compression explained",
-        "video": "https://www.youtube.com/watch?v=sk46MJ_h8Sk"
+        "topic": "Git and version control for Mobile Development projects",
+        "video": "No video found"
       },
       {
-        "topic": "dynamic programming problems Data Structures tabulation",
-        "video": "https://www.youtube.com/watch?v=sWnBVPRA0yQ"
+        "topic": "Common Android Mobile Development interview questions",
+        "video": "No video found"
       },
       {
-        "topic": "greedy algorithms Data Structures optimization problems",
-        "video": "https://www.youtube.com/watch?v=zPtI8q9gvX8"
+        "topic": "Designing responsive Mobile Development UI multiple devices",
+        "video": "No video found"
       },
       {
-        "topic": "memoization vs tabulation Data Structures problems",
-        "video": "https://www.youtube.com/watch?v=5dRGRueKU3M"
+        "topic": "Android Mobile Development app performance optimization",
+        "video": "No video found"
       },
       {
-        "topic": "knapsack problem Data Structures dynamic programming variations",
-        "video": "https://www.youtube.com/watch?v=PfkBS9qIMRE"
+        "topic": "Debugging Android Mobile Development applications effectively",
+        "video": "No video found"
       },
       {
-        "topic": "top 50 Data Structures interview questions",
-        "video": "https://www.youtube.com/watch?v=2AckU9AZc0w"
-      },
-      {
-        "topic": "hard Data Structures problems for placements",
-        "video": "https://www.youtube.com/watch?v=Nx4bvwU0DqE"
-      },
-      {
-        "topic": "Big O notation Data Structures time space complexity analysis",
-        "video": "https://www.youtube.com/watch?v=FPu9Uld7W-E"
-      },
-      {
-        "topic": "system design Data Structures choices discussion",
-        "video": "https://www.youtube.com/watch?v=-mN3VyJuCjM"
+        "topic": "Creating a Mobile Development portfolio for job placements",
+        "video": "No video found"
       }
     ]
   }
